@@ -89,9 +89,11 @@ error[E0412]: cannot find type `Second` in this scope
    |
 19 |     #[metrics(unit = Second)]
    |                      ^^^^^^
-  --> $RUST/core/src/marker.rs
    |
-   = note: similarly named trait `Send` defined here
+  ::: $RUST/core/src/marker.rs
+   |
+   | pub unsafe auto trait Send {
+   | -------------------------- similarly named trait `Send` defined here
    |
 help: a trait with a similar name exists
    |

@@ -9,6 +9,9 @@ error[E0277]: `*const ()` cannot be shared between threads safely
    = help: within `ThreadLocalTestSinkGuard`, the trait `Sync` is not implemented for `*const ()`
 note: required because it appears within the type `PhantomData<*const ()>`
   --> $RUST/core/src/marker.rs
+   |
+   | pub struct PhantomData<T: PointeeSized>;
+   |            ^^^^^^^^^^^
 note: required because it appears within the type `ThreadLocalTestSinkGuard`
   --> $WORKSPACE/metrique-writer-core/src/global.rs
    |
@@ -31,6 +34,9 @@ error[E0277]: `*const ()` cannot be sent between threads safely
    = help: within `ThreadLocalTestSinkGuard`, the trait `Send` is not implemented for `*const ()`
 note: required because it appears within the type `PhantomData<*const ()>`
   --> $RUST/core/src/marker.rs
+   |
+   | pub struct PhantomData<T: PointeeSized>;
+   |            ^^^^^^^^^^^
 note: required because it appears within the type `ThreadLocalTestSinkGuard`
   --> $WORKSPACE/metrique-writer-core/src/global.rs
    |
