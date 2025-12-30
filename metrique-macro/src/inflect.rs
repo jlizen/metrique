@@ -1,6 +1,8 @@
 use darling::FromMeta;
 
-use crate::{enums::MetricsVariant, MetricsField, MetricsFieldKind, Prefix, RootAttributes};
+use crate::{
+    MetricsFieldKind, Prefix, RootAttributes, enums::MetricsVariant, structs::MetricsField,
+};
 
 pub(crate) fn name_contains_uninflectables(name: &str) -> Option<char> {
     name.chars()
