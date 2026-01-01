@@ -6,8 +6,8 @@ use quote::{format_ident, quote, quote_spanned};
 use syn::Ident;
 
 use crate::{
-    MetricsFieldKind, NameStyle, Prefix, RootAttributes, inflect::metric_name,
-    structs::MetricsField, value_impl::format_value,
+    MetricsField, MetricsFieldKind, NameStyle, Prefix, RootAttributes, inflect::metric_name,
+    value_impl::format_value,
 };
 
 /// Generate the implementation of the Entry trait directly instead of using derive(Entry).

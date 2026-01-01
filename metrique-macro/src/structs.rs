@@ -1,144 +1,21 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use darling::FromField;
-use proc_macro2::{Span, TokenStream as Ts2};
-use quote::{format_ident, quote, quote_spanned};
+use proc_macro2::TokenStream as Ts2;
+use quote::{format_ident, quote};
 use syn::{
-    Attribute, DeriveInput, FieldsNamed, FieldsUnnamed, Generics, Ident, Result, Type, Visibility,
-    spanned::Spanned,
+    Attribute, DeriveInput, FieldsNamed, FieldsUnnamed, Generics, Ident, Result, Visibility,
 };
 
 use crate::{
-    MetricMode, MetricsFieldAttrs, MetricsFieldKind, OwnershipKind, RawMetricsFieldAttrs,
-    RootAttributes, clean_attrs, entry_impl, generate_close_value_impls, generate_on_drop_wrapper,
-    value_impl,
+    MetricMode, MetricsField, MetricsFieldKind, RootAttributes, clean_attrs, entry_impl,
+    generate_close_value_impls, generate_on_drop_wrapper, parse_metric_fields, value_impl,
 };
-
-pub(crate) struct MetricsField {
-    pub(crate) vis: Visibility,
-    pub(crate) ident: Ts2,
-    pub(crate) name: Option<String>,
-    pub(crate) span: Span,
-    pub(crate) ty: Type,
-    pub(crate) external_attrs: Vec<Attribute>,
-    pub(crate) attrs: MetricsFieldAttrs,
-}
-
-impl MetricsField {
-    fn core_field(&self, is_named: bool) -> Ts2 {
-        let MetricsField {
-            ref external_attrs,
-            ref ident,
-            ref ty,
-            ref vis,
-            ..
-        } = *self;
-        let field = if is_named {
-            quote! { #ident: #ty }
-        } else {
-            quote! { #ty }
-        };
-        quote! { #(#external_attrs)* #vis #field }
-    }
-
-    fn entry_field(&self, named: bool) -> Option<Ts2> {
-        if let MetricsFieldKind::Ignore(_span) = self.attrs.kind {
-            return None;
-        }
-        let MetricsField {
-            ident, ty, span, ..
-        } = self;
-        let mut base_type = if self.attrs.close {
-            quote_spanned! { *span=> <#ty as metrique::CloseValue>::Closed }
-        } else {
-            quote_spanned! { *span=>#ty }
-        };
-        if let Some(expr) = self.unit() {
-            base_type = quote_spanned! { expr.span()=>
-                <#base_type as ::metrique::unit::AttachUnit>::Output<#expr>
-            }
-        }
-        let inner = if named {
-            quote! { #ident: #base_type }
-        } else {
-            quote! { #base_type }
-        };
-        Some(quote_spanned! { *span=>
-                #[deprecated(note = "these fields will become private in a future release. To introspect an entry, use `metrique::writer::test_util::test_entry`")]
-                #[doc(hidden)]
-                #inner
-        })
-    }
-
-    fn unit(&self) -> Option<&syn::Path> {
-        match &self.attrs.kind {
-            MetricsFieldKind::Field { unit, .. } => unit.as_ref(),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn close_value(&self, ownership_kind: OwnershipKind) -> Ts2 {
-        let ident = &self.ident;
-        let span = self.span;
-        let field_expr = match ownership_kind {
-            OwnershipKind::ByValue => quote_spanned! {span=> self.#ident },
-            OwnershipKind::ByRef => quote_spanned! {span=> &self.#ident },
-        };
-        let base = if self.attrs.close {
-            quote_spanned! {span=> metrique::CloseValue::close(#field_expr) }
-        } else {
-            field_expr
-        };
-
-        let base = if let Some(unit) = self.unit() {
-            quote_spanned! { unit.span() =>
-                #base.into()
-            }
-        } else {
-            base
-        };
-
-        quote! { #ident: #base }
-    }
-}
 
 pub(crate) fn parse_struct_fields(
     fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
 ) -> Result<Vec<MetricsField>> {
-    let mut parsed_fields = vec![];
-    let mut errors = darling::Error::accumulator();
-
-    for (i, field) in fields.iter().enumerate() {
-        let i = syn::Index::from(i);
-        let (ident, name, span) = match &field.ident {
-            Some(ident) => (quote! { #ident }, Some(ident.to_string()), ident.span()),
-            None => (quote! { #i }, None, field.ty.span()),
-        };
-
-        let attrs = match errors
-            .handle(RawMetricsFieldAttrs::from_field(field).and_then(|attr| attr.validate()))
-        {
-            Some(attrs) => attrs,
-            None => {
-                continue;
-            }
-        };
-
-        parsed_fields.push(MetricsField {
-            ident,
-            name,
-            span,
-            ty: field.ty.clone(),
-            vis: field.vis.clone(),
-            external_attrs: clean_attrs(&field.attrs),
-            attrs,
-        });
-    }
-
-    errors.finish()?;
-
-    Ok(parsed_fields)
+    parse_metric_fields(fields)
 }
 
 pub(crate) fn generate_metrics_for_struct(

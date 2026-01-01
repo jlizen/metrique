@@ -23,8 +23,8 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Ts2};
 use quote::{ToTokens, quote, quote_spanned};
 use syn::{
-    Attribute, Data, DeriveInput, Error, Fields, Ident, Result, Visibility, parse_macro_input,
-    spanned::Spanned,
+    Attribute, Data, DeriveInput, Error, Fields, Ident, Result, Type, Visibility,
+    parse_macro_input, spanned::Spanned,
 };
 
 use crate::inflect::{
@@ -501,6 +501,136 @@ impl<T: FromMeta> FromMeta for SpannedKv<T> {
     }
 }
 
+pub(crate) fn entry_type(ty: &syn::Type, close: bool, span: proc_macro2::Span) -> Ts2 {
+    if close {
+        quote::quote_spanned! { span=> <#ty as metrique::CloseValue>::Closed }
+    } else {
+        quote::quote_spanned! { span=> #ty }
+    }
+}
+
+pub(crate) struct MetricsField {
+    pub(crate) vis: Visibility,
+    pub(crate) ident: Ts2,
+    pub(crate) name: Option<String>,
+    pub(crate) span: Span,
+    pub(crate) ty: Type,
+    pub(crate) external_attrs: Vec<Attribute>,
+    pub(crate) attrs: MetricsFieldAttrs,
+}
+
+impl MetricsField {
+    pub(crate) fn core_field(&self, is_named: bool) -> Ts2 {
+        let MetricsField {
+            ref external_attrs,
+            ref ident,
+            ref ty,
+            ref vis,
+            ..
+        } = *self;
+        let field = if is_named {
+            quote! { #ident: #ty }
+        } else {
+            quote! { #ty }
+        };
+        quote! { #(#external_attrs)* #vis #field }
+    }
+
+    pub(crate) fn entry_field(&self, named: bool) -> Option<Ts2> {
+        if let MetricsFieldKind::Ignore(_span) = self.attrs.kind {
+            return None;
+        }
+        let MetricsField {
+            ident, ty, span, ..
+        } = self;
+        let mut base_type = crate::entry_type(ty, self.attrs.close, *span);
+        if let Some(expr) = self.unit() {
+            base_type = quote_spanned! { expr.span()=>
+                <#base_type as ::metrique::unit::AttachUnit>::Output<#expr>
+            }
+        }
+        let inner = if named {
+            quote! { #ident: #base_type }
+        } else {
+            quote! { #base_type }
+        };
+        Some(quote_spanned! { *span=>
+                #[deprecated(note = "these fields will become private in a future release. To introspect an entry, use `metrique::writer::test_util::test_entry`")]
+                #[doc(hidden)]
+                #inner
+        })
+    }
+
+    fn unit(&self) -> Option<&syn::Path> {
+        match &self.attrs.kind {
+            MetricsFieldKind::Field { unit, .. } => unit.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn close_value(&self, ownership_kind: OwnershipKind) -> Ts2 {
+        let ident = &self.ident;
+        let span = self.span;
+        let field_expr = match ownership_kind {
+            OwnershipKind::ByValue => quote_spanned! {span=> self.#ident },
+            OwnershipKind::ByRef => quote_spanned! {span=> &self.#ident },
+        };
+        let base = if self.attrs.close {
+            quote_spanned! {span=> metrique::CloseValue::close(#field_expr) }
+        } else {
+            field_expr
+        };
+
+        let base = if let Some(unit) = self.unit() {
+            quote_spanned! { unit.span() =>
+                #base.into()
+            }
+        } else {
+            base
+        };
+
+        quote! { #ident: #base }
+    }
+}
+
+pub(crate) fn parse_metric_fields(
+    fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
+) -> Result<Vec<MetricsField>> {
+    let mut parsed_fields = vec![];
+    let mut errors = darling::Error::accumulator();
+
+    for (i, field) in fields.iter().enumerate() {
+        let i = syn::Index::from(i);
+        let (ident, name, span) = match &field.ident {
+            Some(ident) => (quote! { #ident }, Some(ident.to_string()), ident.span()),
+            None => (quote! { #i }, None, field.ty.span()),
+        };
+
+        let attrs = match errors
+            .handle(RawMetricsFieldAttrs::from_field(field).and_then(|attr| attr.validate()))
+        {
+            Some(attrs) => attrs,
+            None => {
+                continue;
+            }
+        };
+
+        parsed_fields.push(MetricsField {
+            ident,
+            name,
+            span,
+            ty: field.ty.clone(),
+            vis: field.vis.clone(),
+            external_attrs: clean_attrs(&field.attrs),
+            attrs,
+        });
+    }
+
+    errors.finish()?;
+
+    Ok(parsed_fields)
+}
+
 fn cannot_combine_error(existing: &str, new: &str, new_span: Span) -> darling::Error {
     darling::Error::custom(format!("Cannot combine `{existing}` with `{new}`")).with_span(&new_span)
 }
@@ -778,7 +908,14 @@ fn generate_metrics(root_attributes: RootAttributes, input: DeriveInput) -> Resu
                         ));
                     }
                 },
-                _ => {
+                Data::Enum(data_enum) => {
+                    enums::parse_enum_variants(&data_enum.variants, enums::VariantMode::Data)?;
+                    return Err(Error::new_spanned(
+                        &input,
+                        "Only structs are supported for entries",
+                    ));
+                }
+                Data::Union(_) => {
                     return Err(Error::new_spanned(
                         &input,
                         "Only structs are supported for entries",
@@ -793,7 +930,7 @@ fn generate_metrics(root_attributes: RootAttributes, input: DeriveInput) -> Resu
                 _ => {
                     return Err(Error::new_spanned(
                         &input,
-                        "Only enums are supported for values",
+                        "Only enums are supported with value(string)",
                     ));
                 }
             };
@@ -904,7 +1041,10 @@ fn clean_base_adt(input: &DeriveInput) -> Ts2 {
             _ => input.to_token_stream(),
         },
         Data::Enum(data_enum) => {
-            if let Ok(variants) = enums::parse_enum_variants(&data_enum.variants, false) {
+            if let Ok(variants) = enums::parse_enum_variants(
+                &data_enum.variants,
+                enums::VariantMode::SkipAttributeParsing,
+            ) {
                 enums::generate_base_enum(adt_name, vis, generics, &filtered_attrs, &variants)
             } else {
                 input.to_token_stream()
