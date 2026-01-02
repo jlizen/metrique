@@ -27,13 +27,9 @@ use syn::{
     parse_macro_input, spanned::Spanned,
 };
 
-use crate::inflect::{
-    metric_name, name_contains_dot, name_contains_uninflectables, name_ends_with_delimiter,
-};
+use crate::inflect::{name_contains_dot, name_contains_uninflectables, name_ends_with_delimiter};
 
 /// Transforms a struct or enum into a unit-of-work metric.
-///
-/// Currently, enums are only supported with `value(string)`.
 ///
 /// # Container Attributes
 ///
@@ -67,9 +63,11 @@ use crate::inflect::{
 ///
 /// # Variant Attributes
 ///
+/// For enum usage, see the [Enums](#enums) section below.
+///
 /// | Attribute | Type | Description | Example |
 /// |-----------|------|-------------|---------|
-/// | `name` | String | Overrides the field name in metrics | `#[metrics(name = "CustomName")]` |
+/// | `name` | String | Overrides the variant name in metrics | `#[metrics(name = "CustomName")]` |
 ///
 /// # Metric Names
 ///
@@ -245,15 +243,88 @@ use crate::inflect::{
 ///     }
 /// }
 /// ```
+/// # Enums
+///
+/// Enums can be used in two ways: as value enums or entry enums.
+///
+/// ## Value Enums
+///
+/// Value enums with `#[metrics(value(string))]` convert enum variants to string values.
+/// Only unit variants are allowed. Variant names respect `#[metrics(name = "...")]` and `rename_all`:
+///
+/// ```rust
+/// # use metrique::unit_of_work::metrics;
+/// #[metrics(value(string), rename_all = "snake_case")]
+/// enum Operation {
+///     #[metrics(name = "custom_read")]
+///     ReadData,
+///     WriteData,
+/// }
+/// // Operation::ReadData converts to "custom_read"
+/// // Operation::WriteData converts to "write_data"
+///
+/// #[metrics]
+/// struct Request {
+///     #[metrics(sample_group)]
+///     operation: Operation,
+///     count: usize,
+/// }
+/// ```
+///
+/// ## Entry Enums
+///
+/// Entry enums allow different metric fields per variant. Those fields respect container and
+/// field attributes as used by structs.
+///
+/// Variants can be single-field tuples (which need must use flatten/flatten_entry),
+/// or struct variants with named fields.
+///
+/// ```rust
+/// # use metrique::unit_of_work::metrics;
+/// # use metrique::unit::Millisecond;
+/// # use std::time::Duration;
+///
+/// #[metrics(subfield)]
+/// struct ReadMetrics {
+///     bytes_read: usize,
+/// }
+///
+/// #[metrics(prefix = "op_", rename_all = "PascalCase")]
+/// enum Operation {
+///     Read(#[metrics(flatten)] ReadMetrics),
+///     Write {
+///         #[metrics(unit = Millisecond)]
+///         latency: Duration,
+///         bytes_written: usize,
+///     },
+/// }
+///
+/// let vec_sink = metrique::writer::sink::VecEntrySink::new();
+/// Operation::Read(ReadMetrics { bytes_read: 1024 })
+///     .append_on_drop(vec_sink.clone());
+/// let entries = vec_sink.drain();
+/// let entry = metrique::test_util::to_test_entry(&entries[0]);
+/// assert_eq!(entry.metrics["BytesRead"], 1024);
+///
+/// let vec_sink = metrique::writer::sink::VecEntrySink::new();
+/// Operation::Write { latency: Duration::from_millis(5), bytes_written: 2048 }
+///     .append_on_drop(vec_sink.clone());
+/// let entries = vec_sink.drain();
+/// let entry = metrique::test_util::to_test_entry(&entries[0]);
+/// assert_eq!(entry.metrics["OpLatency"], 5.0);
+/// assert_eq!(entry.metrics["OpBytesWritten"], 2048);
+/// ```
 ///
 /// # Generated Types
 ///
-/// For a struct named `MyMetrics`, the macro generates:
+/// For a struct or entry enum named `MyMetrics`, the macro generates:
 /// - `MyMetricsEntry`: The internal representation used for serialization, implements `InflectableEntry`
 /// - `MyMetricsGuard`: A wrapper that implements `Deref`/`DerefMut` to the original struct and handles emission on drop.
 ///   A type alias to ``AppendAndCloseOnDrop`.
 /// - `MyMetricsHandle`: A shareable handle for concurrent access to the metrics.
 ///   A type alias to ``AppendAndCloseOnDropHandle`.
+///
+/// Value enums do not have new types generated, only trait implementations (`From<&MyEnum> for &'static str`, `SampleGroup`, `Value`).
 #[proc_macro_attribute]
 pub fn metrics(attr: TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -501,6 +572,7 @@ impl<T: FromMeta> FromMeta for SpannedKv<T> {
     }
 }
 
+/// Generate the entry type for a field/variant, optionally closing it
 pub(crate) fn entry_type(ty: &syn::Type, close: bool, span: proc_macro2::Span) -> Ts2 {
     if close {
         quote::quote_spanned! { span=> <#ty as metrique::CloseValue>::Closed }
@@ -575,6 +647,26 @@ impl MetricsField {
             OwnershipKind::ByValue => quote_spanned! {span=> self.#ident },
             OwnershipKind::ByRef => quote_spanned! {span=> &self.#ident },
         };
+        let base = if self.attrs.close {
+            quote_spanned! {span=> metrique::CloseValue::close(#field_expr) }
+        } else {
+            field_expr
+        };
+
+        let base = if let Some(unit) = self.unit() {
+            quote_spanned! { unit.span() =>
+                #base.into()
+            }
+        } else {
+            base
+        };
+
+        quote! { #ident: #base }
+    }
+
+    pub(crate) fn close_field_expr(&self, field_expr: Ts2) -> Ts2 {
+        let ident = &self.ident;
+        let span = self.span;
         let base = if self.attrs.close {
             quote_spanned! {span=> metrique::CloseValue::close(#field_expr) }
         } else {
@@ -892,9 +984,9 @@ fn generate_metrics(root_attributes: RootAttributes, input: DeriveInput) -> Resu
         MetricMode::RootEntry
         | MetricMode::Subfield
         | MetricMode::SubfieldOwned
-        | MetricMode::Value => {
-            let fields = match &input.data {
-                Data::Struct(data_struct) => match &data_struct.fields {
+        | MetricMode::Value => match &input.data {
+            Data::Struct(data_struct) => {
+                let fields = match &data_struct.fields {
                     Fields::Named(fields_named) => &fields_named.named,
                     Fields::Unnamed(fields_unnamed)
                         if root_attributes.mode == MetricMode::Value =>
@@ -907,23 +999,21 @@ fn generate_metrics(root_attributes: RootAttributes, input: DeriveInput) -> Resu
                             "Only named fields are supported",
                         ));
                     }
-                },
-                Data::Enum(data_enum) => {
+                };
+                structs::generate_metrics_for_struct(root_attributes, &input, fields)?
+            }
+            Data::Enum(data_enum) => {
+                let variants =
                     enums::parse_enum_variants(&data_enum.variants, enums::VariantMode::Data)?;
-                    return Err(Error::new_spanned(
-                        &input,
-                        "Only structs are supported for entries",
-                    ));
-                }
-                Data::Union(_) => {
-                    return Err(Error::new_spanned(
-                        &input,
-                        "Only structs are supported for entries",
-                    ));
-                }
-            };
-            structs::generate_metrics_for_struct(root_attributes, &input, fields)?
-        }
+                enums::generate_metrics_for_enum(root_attributes, &input, &variants)?
+            }
+            Data::Union(_) => {
+                return Err(Error::new_spanned(
+                    &input,
+                    "Only structs and enums are supported for entries",
+                ));
+            }
+        },
         MetricMode::ValueString => {
             let variants = match &input.data {
                 Data::Enum(data_enum) => &data_enum.variants,
@@ -934,7 +1024,8 @@ fn generate_metrics(root_attributes: RootAttributes, input: DeriveInput) -> Resu
                     ));
                 }
             };
-            enums::generate_metrics_for_enum(root_attributes, &input, variants)?
+            let variants = enums::parse_enum_variants(variants, enums::VariantMode::ValueString)?;
+            enums::generate_metrics_for_enum(root_attributes, &input, &variants)?
         }
     };
 
@@ -1208,5 +1299,57 @@ mod tests {
 
         let parsed_file = metrics_impl_string(input, quote!(metrics()));
         assert_snapshot!("field_exact_prefix_struct", parsed_file);
+    }
+
+    #[test]
+    fn test_entry_enum() {
+        let nested = metrics_impl_string(
+            quote! {
+                #[metrics(subfield)]
+                struct Nested {
+                    value: u32,
+                }
+            },
+            quote!(metrics(subfield)),
+        );
+        let status = metrics_impl_string(
+            quote! {
+                #[metrics(subfield)]
+                enum Status {
+                    Active {
+                        count: u32,
+                        #[metrics(unit = metrique::writer::unit::Millisecond)]
+                        latency: u64,
+                    },
+                    Pending(#[metrics(flatten)] Nested),
+                }
+            },
+            quote!(metrics(subfield)),
+        );
+        let root = metrics_impl_string(
+            quote! {
+                enum Operation {
+                    Read { bytes: u64 },
+                    Write(#[metrics(flatten)] Nested),
+                }
+            },
+            quote!(metrics()),
+        );
+
+        let parsed_file = format!("{}\n{}\n{}", nested, status, root);
+        assert_snapshot!("entry_enum", parsed_file);
+    }
+
+    #[test]
+    fn test_subfield_struct() {
+        let input = quote! {
+            #[metrics(subfield)]
+            struct NestedMetrics {
+                counter: u32,
+            }
+        };
+
+        let parsed_file = metrics_impl_string(input, quote!(metrics(subfield)));
+        assert_snapshot!("subfield_struct", parsed_file);
     }
 }

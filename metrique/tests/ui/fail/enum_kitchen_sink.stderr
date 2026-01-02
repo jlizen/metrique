@@ -58,8 +58,71 @@ error: Unknown field: `timestamp`. Available values: `name`
 62 |     #[metrics(timestamp)]
    |               ^^^^^^^^^
 
-error: entry enums cannot have unit variants; use #[metrics(value(string))] for unit-only enums
-  --> tests/ui/fail/enum_kitchen_sink.rs:69:5
+error: tuple variant fields must use #[metrics(flatten)] or #[metrics(flatten_entry)]
+  --> tests/ui/fail/enum_kitchen_sink.rs:69:13
    |
-69 |     Success,
-   |     ^^^^^^^
+69 |     Variant(#[metrics(unit = metrique::writer::unit::Millisecond)] u32),
+   |             ^
+
+error: tuple variant fields must use #[metrics(flatten)] or #[metrics(flatten_entry)]
+  --> tests/ui/fail/enum_kitchen_sink.rs:75:13
+   |
+75 |     Variant(#[metrics(timestamp)] metrique::Timestamp),
+   |             ^
+
+error: tuple variants must have exactly one field
+  --> tests/ui/fail/enum_kitchen_sink.rs:81:12
+   |
+81 |     Variant(#[metrics(flatten)] u32, #[metrics(flatten)] u32),
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: Cannot combine `flatten` with `unit`
+  --> tests/ui/fail/enum_kitchen_sink.rs:87:32
+   |
+87 |     Variant(#[metrics(flatten, unit = metrique::writer::unit::Millisecond)] u32),
+   |                                ^^^^
+
+error: entry enums cannot have unit variants; use #[metrics(value(string))] for unit-only enums
+   --> tests/ui/fail/enum_kitchen_sink.rs:123:5
+    |
+123 |     Success,
+    |     ^^^^^^^
+
+error[E0277]: CloseValue is not implemented for &TimestampOnClose
+  --> tests/ui/fail/enum_kitchen_sink.rs:97:5
+   |
+97 |     timestamp: metrique::timers::TimestampOnClose,
+   |     ^^^^^^^^^ This type must implement `CloseValue`
+   |
+   = help: the trait `CloseValue` is not implemented for `&TimestampOnClose`
+   = note: You may need to add `#[metrics]` to `&TimestampOnClose` or implement `CloseValue` directly.
+   = note: if &TimestampOnClose implements `Value` but not `CloseValue`, add `#[metrics(no_close)]`
+   = note: If this type is `&T`, is closed inside a flattened entry, and `T` implements `CloseValue`, consider using `#[metrics(subfield_owned)]`.
+   = help: the trait `CloseValue` is implemented for `TimestampOnClose`
+
+error[E0277]: CloseValue is not implemented for &String
+   --> tests/ui/fail/enum_kitchen_sink.rs:102:5
+    |
+102 |     value: String,
+    |     ^^^^^ This type must implement `CloseValue`
+    |
+    = help: the trait `CloseValue` is not implemented for `&String`
+    = note: You may need to add `#[metrics]` to `&String` or implement `CloseValue` directly.
+    = note: if &String implements `Value` but not `CloseValue`, add `#[metrics(no_close)]`
+    = note: If this type is `&T`, is closed inside a flattened entry, and `T` implements `CloseValue`, consider using `#[metrics(subfield_owned)]`.
+help: consider dereferencing here
+    |
+102 |     *value: String,
+    |     +
+
+error[E0277]: CloseValue is not implemented for &TimestampOnClose
+   --> tests/ui/fail/enum_kitchen_sink.rs:107:14
+    |
+107 |     Active { timestamp: metrique::timers::TimestampOnClose },
+    |              ^^^^^^^^^ This type must implement `CloseValue`
+    |
+    = help: the trait `CloseValue` is not implemented for `&TimestampOnClose`
+    = note: You may need to add `#[metrics]` to `&TimestampOnClose` or implement `CloseValue` directly.
+    = note: if &TimestampOnClose implements `Value` but not `CloseValue`, add `#[metrics(no_close)]`
+    = note: If this type is `&T`, is closed inside a flattened entry, and `T` implements `CloseValue`, consider using `#[metrics(subfield_owned)]`.
+    = help: the trait `CloseValue` is implemented for `TimestampOnClose`
