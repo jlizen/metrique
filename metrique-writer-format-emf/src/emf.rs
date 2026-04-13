@@ -1676,6 +1676,10 @@ impl metrique_writer_core::ValueWriter for EmfArrayElementWriter<'_> {
         self.0.json_string(value);
     }
 
+    /// Write a single numeric value from the first observation in the distribution.
+    /// Only the first observation is used; additional observations, units, and
+    /// dimensions are ignored since this element lives inside a JSON array, not
+    /// in the `_aws` metric definition block.
     fn metric<'a>(
         self,
         distribution: impl IntoIterator<Item = Observation>,

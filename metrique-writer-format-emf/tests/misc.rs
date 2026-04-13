@@ -208,3 +208,45 @@ fn test_vec_emits_json_array_through_boxed_entry() {
     let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
     assert_json_diff::assert_json_eq!(output["Plugins"], serde_json::json!(["a", "b"]));
 }
+
+struct VecU64Entry {
+    counts: Vec<u64>,
+}
+
+impl Entry for VecU64Entry {
+    fn write<'a>(&'a self, writer: &mut impl EntryWriter<'a>) {
+        writer.timestamp(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        writer.value("Counts", &self.counts);
+    }
+}
+
+#[test]
+fn test_vec_u64_emits_json_array_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream
+        .next(&VecU64Entry {
+            counts: vec![10, 20, 30],
+        })
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Counts"], serde_json::json!([10, 20, 30]));
+}
+
+#[test]
+fn test_single_u64_vec_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream.next(&VecU64Entry { counts: vec![42] }).unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Counts"], serde_json::json!([42]));
+}
+
+#[test]
+fn test_empty_u64_vec_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream.next(&VecU64Entry { counts: vec![] }).unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Counts"], serde_json::json!([]));
+}
