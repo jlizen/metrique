@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.24](https://github.com/awslabs/metrique/compare/metrique-v0.1.23...metrique-v0.1.24) - 2026-04-13
+
+### Added
+
+- Tokio runtime metrics integration via `metrique-util` (feature: `tokio-metrics-bridge`). Spawns a background reporter that periodically appends `RuntimeMetrics` snapshots (worker utilization, park counts, queue depths, poll durations, etc.) to the attached sink. The reporter is automatically aborted when the attach handle drops. ([#256](https://github.com/awslabs/metrique/pull/256))
+
+  ```rust
+  use metrique_util::{AttachGlobalEntrySinkTokioMetricsExt, TokioRuntimeMetricsConfig};
+
+  let _handle = ServiceMetrics::attach_to_stream(
+      Emf::all_validations("MyApp".to_string(), vec![vec![]])
+          .output_to(std::io::stderr()),
+  );
+
+  let config = TokioRuntimeMetricsConfig::default()
+      .with_interval(Duration::from_secs(30))
+      .with_name_style(MetricNameStyle::KebabCase);
+  ServiceMetrics::subscribe_tokio_runtime_metrics(config);
+  ```
+
+- `Vec<V: Value>` and `[V: Value]` now implement `Value`, so vector fields emit as native JSON arrays in EMF and comma-joined strings in other formats. Elements that write nothing (e.g. `None` in `Vec<Option<String>>`) are skipped automatically. ([#266](https://github.com/awslabs/metrique/pull/266))
+
+  ```rust
+  #[metrics(rename_all = "PascalCase")]
+  struct RequestMetrics {
+      plugins: Vec<String>,
+      request_count: u32,
+  }
+  // EMF output: {"Plugins": ["auth", "cache"], "RequestCount": 5}
+  // Default:   Plugins=auth,cache
+  ```
+
+- `OwnedCounterGuard`: an owned variant of `CounterGuard` that holds an `Arc<Counter>` instead of a reference, allowing it to be moved across async boundaries or stored in structs without lifetime constraints. Returned by `Counter::increment_owned`. ([#265](https://github.com/awslabs/metrique/pull/265))
+
+  ```rust
+  use std::sync::Arc;
+  use metrique::Counter;
+
+  let counter = Arc::new(Counter::new(0));
+  let (guard, count) = counter.increment_owned(); // +1 now, -1 on drop
+  // guard can be stored in a response body wrapper, moved into a spawned task, etc.
+  tokio::spawn(async move {
+      do_work().await;
+      drop(guard); // decrements when the task completes
+  });
+  ```
+
+### Fixed
+
+- Convert broken reference-style links to inline links in README ([#262](https://github.com/awslabs/metrique/pull/262))
+
 ## [0.1.23](https://github.com/awslabs/metrique/compare/metrique-v0.1.22...metrique-v0.1.23) - 2026-04-01
 
 ### Added
