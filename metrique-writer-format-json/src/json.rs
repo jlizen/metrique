@@ -225,11 +225,15 @@ impl ValueWriter for JsonArrayElementWriter<'_> {
 
     fn metric<'a>(
         self,
-        _distribution: impl IntoIterator<Item = Observation>,
+        distribution: impl IntoIterator<Item = Observation>,
         _unit: Unit,
         _dimensions: impl IntoIterator<Item = (&'a str, &'a str)>,
         _flags: MetricFlags<'_>,
     ) {
+        // Write only the first observation as a scalar value in the array.
+        if let Some(obs) = distribution.into_iter().next() {
+            push_observation(self.0, obs, None);
+        }
     }
 
     fn error(self, _error: ValidationError) {}
@@ -892,5 +896,34 @@ mod tests {
             .unwrap();
         let json = parse_output(&output);
         assert_eq!(json["properties"]["Tags"], serde_json::json!(["a", "c"]));
+    }
+
+    #[test]
+    fn test_vec_u64_emits_json_array() {
+        struct VecU64Entry {
+            counts: Vec<u64>,
+        }
+        impl Entry for VecU64Entry {
+            fn write<'a>(&'a self, writer: &mut impl EntryWriter<'a>) {
+                writer.timestamp(SystemTime::UNIX_EPOCH);
+                writer.value("Counts", &self.counts);
+            }
+        }
+
+        let mut format = Json::new();
+        let mut output = Vec::new();
+        format
+            .format(
+                &VecU64Entry {
+                    counts: vec![10, 20, 30],
+                },
+                &mut output,
+            )
+            .unwrap();
+        let json = parse_output(&output);
+        assert_eq!(
+            json["properties"]["Counts"],
+            serde_json::json!([10, 20, 30])
+        );
     }
 }
