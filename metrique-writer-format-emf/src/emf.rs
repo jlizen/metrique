@@ -1669,6 +1669,9 @@ impl ValueWriter<'_, '_> {
 }
 
 /// Adapter for writing individual elements inside a JSON array in EMF output.
+///
+/// String values are JSON-escaped. Metric values write their observations as
+/// numeric scalars (single observation) or nested sub-arrays (multiple observations).
 struct EmfArrayElementWriter<'a>(&'a mut PrefixedStringBuf);
 
 impl metrique_writer_core::ValueWriter for EmfArrayElementWriter<'_> {
@@ -1676,10 +1679,6 @@ impl metrique_writer_core::ValueWriter for EmfArrayElementWriter<'_> {
         self.0.json_string(value);
     }
 
-    /// Write a single numeric value from the first observation in the distribution.
-    /// Only the first observation is used; additional observations, units, and
-    /// dimensions are ignored since this element lives inside a JSON array, not
-    /// in the `_aws` metric definition block.
     fn metric<'a>(
         self,
         distribution: impl IntoIterator<Item = Observation>,
@@ -1687,32 +1686,61 @@ impl metrique_writer_core::ValueWriter for EmfArrayElementWriter<'_> {
         _dimensions: impl IntoIterator<Item = (&'a str, &'a str)>,
         _flags: MetricFlags<'_>,
     ) {
-        if let Some(obs) = distribution.into_iter().next() {
-            match obs {
-                Observation::Unsigned(v) => {
-                    self.0.push_integer(v);
-                }
-                Observation::Floating(v) => {
-                    if let Some(v) = clamp_to_finite(v, "") {
-                        ValueWriter::write_float(self.0, v);
+        let buf = self.0;
+        let mut iter = distribution.into_iter();
+        let Some(first) = iter.next() else { return };
+        match iter.next() {
+            None => write_emf_observation(buf, first),
+            Some(second) => {
+                buf.push('[');
+                let mut wrote_any = false;
+                for obs in std::iter::once(first)
+                    .chain(std::iter::once(second))
+                    .chain(iter)
+                {
+                    let before = buf.as_str().len();
+                    if wrote_any {
+                        buf.push(',');
                     }
-                }
-                Observation::Repeated { total, occurrences } => {
-                    let mean = if occurrences == 0 {
-                        0.0
+                    let after_sep = buf.as_str().len();
+                    write_emf_observation(buf, obs);
+                    if buf.as_str().len() > after_sep {
+                        wrote_any = true;
                     } else {
-                        total / occurrences as f64
-                    };
-                    if let Some(v) = clamp_to_finite(mean, "") {
-                        ValueWriter::write_float(self.0, v);
+                        buf.truncate(before);
                     }
                 }
-                _ => {}
+                buf.push(']');
             }
         }
     }
 
     fn error(self, _error: ValidationError) {}
+}
+
+/// Write a single observation value into an EMF buffer.
+fn write_emf_observation(buf: &mut PrefixedStringBuf, obs: Observation) {
+    match obs {
+        Observation::Unsigned(v) => {
+            buf.push_integer(v);
+        }
+        Observation::Floating(v) => {
+            if let Some(v) = clamp_to_finite(v, "") {
+                ValueWriter::write_float(buf, v);
+            }
+        }
+        Observation::Repeated { total, occurrences } => {
+            let mean = if occurrences == 0 {
+                0.0
+            } else {
+                total / occurrences as f64
+            };
+            if let Some(v) = clamp_to_finite(mean, "") {
+                ValueWriter::write_float(buf, v);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl metrique_writer_core::ValueWriter for ValueWriter<'_, '_> {

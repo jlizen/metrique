@@ -15,7 +15,7 @@ mod primitive;
 pub use dimensions::{WithDimension, WithDimensions, WithVecDimensions};
 pub use force::{FlagConstructor, ForceFlag};
 pub use formatter::{FormattedValue, Lifted, NotLifted, ToString, ValueFormatter};
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, fmt::Write, sync::Arc};
 
 pub use flags::{Distribution, MetricFlags, MetricOptions};
 
@@ -105,7 +105,8 @@ pub trait ValueWriter: Sized {
 }
 
 /// Adapter that captures a [`Value`]'s string representation into a buffer.
-/// Only captures string values; metrics and errors are ignored.
+/// Strings are appended directly. Metric observations are written as their
+/// numeric string representation, comma-separated within a single element.
 pub(crate) struct StringCapture<'a>(pub(crate) &'a mut String);
 
 impl ValueWriter for StringCapture<'_> {
@@ -115,12 +116,29 @@ impl ValueWriter for StringCapture<'_> {
 
     fn metric<'a>(
         self,
-        _distribution: impl IntoIterator<Item = Observation>,
+        distribution: impl IntoIterator<Item = Observation>,
         _unit: Unit,
         _dimensions: impl IntoIterator<Item = (&'a str, &'a str)>,
         _flags: MetricFlags<'_>,
     ) {
-        // Intentionally a no-op: values() is for string properties only.
+        let mut first = true;
+        for obs in distribution {
+            if !first {
+                self.0.push(',');
+            }
+            first = false;
+            match obs {
+                Observation::Unsigned(v) => {
+                    let _ = write!(self.0, "{v}");
+                }
+                Observation::Floating(v) => {
+                    let _ = write!(self.0, "{v}");
+                }
+                Observation::Repeated { total, .. } => {
+                    let _ = write!(self.0, "{total}");
+                }
+            }
+        }
     }
 
     fn error(self, _error: ValidationError) {}

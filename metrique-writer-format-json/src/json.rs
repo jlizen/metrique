@@ -216,6 +216,9 @@ struct JsonValueWriter<'b, 'c> {
 }
 
 /// Adapter for writing individual elements inside a JSON array.
+///
+/// String values are JSON-escaped. Metric values write their observations as
+/// numeric scalars (single observation) or nested sub-arrays (multiple observations).
 struct JsonArrayElementWriter<'a>(&'a mut String);
 
 impl ValueWriter for JsonArrayElementWriter<'_> {
@@ -230,9 +233,22 @@ impl ValueWriter for JsonArrayElementWriter<'_> {
         _dimensions: impl IntoIterator<Item = (&'a str, &'a str)>,
         _flags: MetricFlags<'_>,
     ) {
-        // Write only the first observation as a scalar value in the array.
-        if let Some(obs) = distribution.into_iter().next() {
-            push_observation(self.0, obs, None);
+        let buf = self.0;
+        let mut iter = distribution.into_iter();
+        let Some(first) = iter.next() else { return };
+        match iter.next() {
+            None => push_observation(buf, first, None),
+            Some(second) => {
+                buf.push('[');
+                push_observation(buf, first, None);
+                buf.push(',');
+                push_observation(buf, second, None);
+                for obs in iter {
+                    buf.push(',');
+                    push_observation(buf, obs, None);
+                }
+                buf.push(']');
+            }
         }
     }
 
@@ -924,6 +940,46 @@ mod tests {
         assert_eq!(
             json["properties"]["Counts"],
             serde_json::json!([10, 20, 30])
+        );
+    }
+
+    #[test]
+    fn test_vec_multi_observation_nests_sub_arrays_in_json() {
+        struct MultiObsValue(Vec<u64>);
+        impl Value for MultiObsValue {
+            fn write(&self, writer: impl ValueWriter) {
+                writer.metric(
+                    self.0.iter().map(|&v| Observation::Unsigned(v)),
+                    Unit::None,
+                    [],
+                    MetricFlags::empty(),
+                );
+            }
+        }
+        struct VecMultiObsEntry {
+            data: Vec<MultiObsValue>,
+        }
+        impl Entry for VecMultiObsEntry {
+            fn write<'a>(&'a self, writer: &mut impl EntryWriter<'a>) {
+                writer.timestamp(SystemTime::UNIX_EPOCH);
+                writer.value("Data", &self.data);
+            }
+        }
+
+        let mut format = Json::new();
+        let mut output = Vec::new();
+        format
+            .format(
+                &VecMultiObsEntry {
+                    data: vec![MultiObsValue(vec![1, 2, 3]), MultiObsValue(vec![4, 5])],
+                },
+                &mut output,
+            )
+            .unwrap();
+        let json = parse_output(&output);
+        assert_eq!(
+            json["properties"]["Data"],
+            serde_json::json!([[1, 2, 3], [4, 5]])
         );
     }
 }
