@@ -7,7 +7,7 @@
 //! routing config, in-flight counters) that should appear on every
 //! metric record for correlation during debugging.
 //!
-//! This example shows two approaches:
+//! This example shows three approaches:
 //!
 //! 1. **Borrowed (`&'static`)**: `Counter` and `OnceLock<State<T>>`
 //!    live in statics. Cheap, no `Arc` overhead, but not injectable
@@ -18,6 +18,11 @@
 //!    that is cloned into each request's metrics. Cloning shares the
 //!    underlying `Counter` (via `Arc`) and gives each request a fresh
 //!    `State` snapshot slot. More flexible, easy to inject in tests.
+//!
+//! 3. **Progressive population**: [`StateRef`](metrique_util::StateRef)
+//!    wraps a struct containing `OnceLock` fields that start empty and
+//!    are filled during request processing. Fields still empty at
+//!    emission time close as `None`.
 //!
 //! Both patterns flatten shared state into the per-request metric, so
 //! every emitted record includes the current counter value, config
@@ -40,7 +45,7 @@ use metrique::{
     unit_of_work::metrics,
     writer::{AttachGlobalEntrySinkExt, FormatExt, GlobalEntrySink},
 };
-use metrique_util::State;
+use metrique_util::{State, StateRef};
 
 // ---------------------------------------------------------------------------
 // Borrowed (static) state
@@ -115,6 +120,27 @@ impl AppState {
 }
 
 // ---------------------------------------------------------------------------
+// Progressive population with OnceLock in State
+// ---------------------------------------------------------------------------
+
+// OnceLock fields start empty and are filled during request processing.
+// Fields still empty at emission time close as None.
+#[metrics(subfield)]
+struct RequestEnvironment {
+    resolved_endpoint: OnceLock<&'static str>,
+    cache_hit: OnceLock<bool>,
+}
+
+impl RequestEnvironment {
+    fn new() -> Self {
+        Self {
+            resolved_endpoint: OnceLock::new(),
+            cache_hit: OnceLock::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-request metrics
 // ---------------------------------------------------------------------------
 
@@ -125,6 +151,8 @@ struct RequestMetrics {
     static_state: BorrowedState,
     #[metrics(flatten)]
     app_state: AppState,
+    #[metrics(flatten)]
+    request_env: StateRef<RequestEnvironment>,
 }
 
 impl RequestMetrics {
@@ -133,6 +161,7 @@ impl RequestMetrics {
             throttled: false,
             static_state: BorrowedState::new(),
             app_state: state.clone(),
+            request_env: StateRef::new(RequestEnvironment::new()),
         }
         .append_on_drop(ServiceMetrics::sink())
     }
@@ -161,10 +190,11 @@ async fn main() {
     //
     // Requests 1 and 2 see the default config (NoThrottle, feature off).
     // Request 3 starts after the 1s refresh, sees the new config (Throttle, feature on).
+    // All requests populate ResolvedEndpoint and CacheHit via OnceLock.
     //
-    // {"Throttled":0,"InFlight":1,"ActiveRequests":0,"FeatureXyzEnabled":0,"NodeGroup":"us-east-1a","ThrottlePolicy":"NoThrottle", ...}
-    // {"Throttled":0,"InFlight":0,"ActiveRequests":0,"FeatureXyzEnabled":0,"NodeGroup":"us-east-1a","ThrottlePolicy":"NoThrottle", ...}
-    // {"Throttled":1,"InFlight":0,"ActiveRequests":0,"FeatureXyzEnabled":1,"NodeGroup":"us-east-1a","ThrottlePolicy":"Throttle", ...}
+    // {"Throttled":0,"InFlight":1,"ActiveRequests":0,"FeatureXyzEnabled":0,"ThrottlePolicy":"NoThrottle","ResolvedEndpoint":"us-east-1","CacheHit":0, ...}
+    // {"Throttled":0,"InFlight":0,"ActiveRequests":0,"FeatureXyzEnabled":0,"ThrottlePolicy":"NoThrottle","ResolvedEndpoint":"us-east-1","CacheHit":0, ...}
+    // {"Throttled":1,"InFlight":0,"ActiveRequests":0,"FeatureXyzEnabled":1,"ThrottlePolicy":"Throttle","ResolvedEndpoint":"us-east-1","CacheHit":0, ...}
 }
 
 async fn handle_request(state: &AppState) {
@@ -177,12 +207,19 @@ async fn handle_request(state: &AppState) {
         metrics.throttled = true;
     }
 
+    // Progressively populate OnceLock fields as information becomes
+    // available. Fields not set by emission time close as None.
+    let env = metrics.request_env.snapshot();
+    env.resolved_endpoint.set("us-east-1").ok();
+
     let _guard = IN_FLIGHT.increment_scoped();
-    do_some_work().await;
+    let cached = do_some_work().await;
+    env.cache_hit.set(cached).ok();
 }
 
-async fn do_some_work() {
+async fn do_some_work() -> bool {
     tokio::time::sleep(Duration::from_millis(1500)).await;
+    false // simulate a cache miss
 }
 
 // ---------------------------------------------------------------------------

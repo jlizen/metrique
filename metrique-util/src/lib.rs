@@ -8,7 +8,7 @@
 #[cfg(feature = "state")]
 mod state;
 #[cfg(feature = "state")]
-pub use state::{LatestRef, State};
+pub use state::{LatestRef, State, StateRef};
 
 #[cfg(feature = "tokio-metrics-bridge")]
 mod dynamic_inflection;

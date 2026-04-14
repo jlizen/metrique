@@ -6,7 +6,72 @@
 
 use std::sync::{Arc, OnceLock};
 
-use metrique_core::CloseValue;
+use metrique_core::{CloseValue, CloseValueRef};
+
+/// Shared core for [`State`] and [`StateRef`].
+struct StateInner<T> {
+    swap: Arc<arc_swap::ArcSwap<T>>,
+    snap: OnceLock<Arc<T>>,
+}
+
+impl<T> StateInner<T> {
+    fn new(val: T) -> Self {
+        Self {
+            swap: Arc::new(arc_swap::ArcSwap::from_pointee(val)),
+            snap: OnceLock::new(),
+        }
+    }
+
+    fn store(&self, val: Arc<T>) {
+        self.swap.store(val);
+    }
+
+    fn snapshot(&self) -> Arc<T> {
+        self.snap.get_or_init(|| self.swap.load_full()).clone()
+    }
+
+    fn latest(&self) -> LatestRef<T> {
+        LatestRef(self.swap.load())
+    }
+}
+
+impl<T> Clone for StateInner<T> {
+    fn clone(&self) -> Self {
+        Self {
+            swap: self.swap.clone(),
+            snap: OnceLock::new(),
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> StateInner<T> {
+    fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>, name: &str) -> std::fmt::Result {
+        let mut d = f.debug_struct(name);
+        d.field("current", &*self.swap.load());
+        if let Some(snap) = self.snap.get() {
+            d.field("snapshot", snap);
+        }
+        d.finish()
+    }
+}
+
+/// A cheap, short-lived reference returned by [`State::latest`] and
+/// [`StateRef::latest`].
+///
+/// Always reads the latest value (bypasses the snapshot). This means
+/// that the guarded value might differ from metrics emitted by its related
+/// [`State`] or [`StateRef`].
+///
+/// Derefs to `T` without cloning. Not `Send`; for cross-task use, call
+/// [`snapshot`](State::snapshot) instead.
+pub struct LatestRef<T>(arc_swap::Guard<Arc<T>>);
+
+impl<T> std::ops::Deref for LatestRef<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
 
 /// An atomically swappable shared value where each cloned handle captures a
 /// snapshot on first read.
@@ -16,6 +81,11 @@ use metrique_core::CloseValue;
 /// current value and emit metrics reflecting what they saw. `State`
 /// ensures the value captured for metrics matches the value used during
 /// processing, even if a background task swaps in a new value mid-request.
+///
+/// `State` requires `T: Clone` so it can extract the value from the
+/// internal `Arc` for closing. If your `T` is not `Clone` but implements
+/// [`CloseValueRef`] (i.e. both `CloseValue for T` and `CloseValue for &T`),
+/// use [`StateRef`] instead.
 ///
 /// # Usage
 ///
@@ -84,35 +154,12 @@ use metrique_core::CloseValue;
 /// let next_request = shared.clone();
 /// assert_eq!(*next_request.snapshot(), "v2");
 /// ```
-pub struct State<T> {
-    swap: Arc<arc_swap::ArcSwap<T>>,
-    snap: OnceLock<Arc<T>>,
-}
-
-/// A cheap, short-lived reference returned by [`State::latest`].
-///
-/// Always reads the latest value (bypasses the snapshot). This means
-/// that the guarded value might differ from metrics emitted by its related
-/// [`State`].
-///
-/// Derefs to `T` without cloning. Not `Send`; for cross-task use, call
-/// [`snapshot`](State::snapshot) instead.
-pub struct LatestRef<T>(arc_swap::Guard<Arc<T>>);
-
-impl<T> std::ops::Deref for LatestRef<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
+pub struct State<T>(StateInner<T>);
 
 impl<T> State<T> {
     /// Create a new `State` from an initial value.
     pub fn new(val: T) -> Self {
-        Self {
-            swap: Arc::new(arc_swap::ArcSwap::from_pointee(val)),
-            snap: OnceLock::new(),
-        }
+        Self(StateInner::new(val))
     }
 
     /// Atomically replace the shared value.
@@ -122,7 +169,7 @@ impl<T> State<T> {
     /// captured one. A handle that has already called `snapshot` is
     /// unaffected; its captured value is immutable.
     pub fn store(&self, val: Arc<T>) {
-        self.swap.store(val);
+        self.0.store(val);
     }
 
     /// Capture and return a snapshot of the current value.
@@ -130,7 +177,7 @@ impl<T> State<T> {
     /// The first call captures the value; subsequent calls return the
     /// same `Arc<T>`.
     pub fn snapshot(&self) -> Arc<T> {
-        self.snap.get_or_init(|| self.swap.load_full()).clone()
+        self.0.snapshot()
     }
 
     /// Get a cheap guard for the latest shared value, bypassing the snapshot.
@@ -142,7 +189,7 @@ impl<T> State<T> {
     ///
     /// Returns a [`LatestRef`] that derefs to `T`.
     pub fn latest(&self) -> LatestRef<T> {
-        LatestRef(self.swap.load())
+        self.0.latest()
     }
 }
 
@@ -150,21 +197,13 @@ impl<T> Clone for State<T> {
     /// Clone produces a fresh handle to the same shared value, without a
     /// captured snapshot.
     fn clone(&self) -> Self {
-        Self {
-            swap: self.swap.clone(),
-            snap: OnceLock::new(),
-        }
+        Self(self.0.clone())
     }
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for State<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut d = f.debug_struct("State");
-        d.field("current", &*self.swap.load());
-        if let Some(snap) = self.snap.get() {
-            d.field("snapshot", snap);
-        }
-        d.finish()
+        self.0.debug_fmt(f, "State")
     }
 }
 
@@ -192,13 +231,108 @@ where
     }
 }
 
+/// Like [`State`], but closes by reference instead of cloning.
+///
+/// Use this when `T` is not `Clone` but implements [`CloseValueRef`]
+/// (i.e. both `CloseValue for T` and `CloseValue for &T`). This is
+/// common for `#[metrics(subfield)]` structs containing non-Clone fields
+/// like [`OnceLock`](std::sync::OnceLock).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::OnceLock;
+///
+/// #[metrics(subfield)]
+/// struct Environment {
+///     feature_flag: bool,
+///     // Populated later; emits None if still empty at close time.
+///     resolved_region: OnceLock<&'static str>,
+/// }
+///
+/// #[metrics(rename_all = "PascalCase")]
+/// struct RequestMetrics {
+///     #[metrics(flatten)]
+///     env: StateRef<Environment>,
+/// }
+/// ```
+///
+/// See [`State`] for full documentation on snapshot semantics.
+pub struct StateRef<T>(StateInner<T>);
+
+impl<T> StateRef<T> {
+    /// Create a new `StateRef` from an initial value.
+    pub fn new(val: T) -> Self {
+        Self(StateInner::new(val))
+    }
+
+    /// Atomically replace the shared value. Existing snapshots are unaffected.
+    ///
+    /// See [`State::store`] for details.
+    pub fn store(&self, val: Arc<T>) {
+        self.0.store(val);
+    }
+
+    /// Capture and return a snapshot of the current value.
+    /// The first call pins the snapshot; subsequent calls return the same `Arc<T>`.
+    ///
+    /// See [`State::snapshot`] for details.
+    pub fn snapshot(&self) -> Arc<T> {
+        self.0.snapshot()
+    }
+
+    /// Get a cheap guard for the latest shared value, bypassing the snapshot.
+    /// The returned value may differ from what metrics will emit on close.
+    ///
+    /// See [`State::latest`] for details.
+    pub fn latest(&self) -> LatestRef<T> {
+        self.0.latest()
+    }
+}
+
+impl<T> Clone for StateRef<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for StateRef<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.debug_fmt(f, "StateRef")
+    }
+}
+
+#[diagnostic::do_not_recommend]
+impl<T> CloseValue for StateRef<T>
+where
+    T: CloseValueRef,
+{
+    type Closed = T::Closed;
+
+    fn close(self) -> Self::Closed {
+        self.snapshot().close()
+    }
+}
+
+#[diagnostic::do_not_recommend]
+impl<T> CloseValue for &'_ StateRef<T>
+where
+    T: CloseValueRef,
+{
+    type Closed = T::Closed;
+
+    fn close(self) -> Self::Closed {
+        self.snapshot().close()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use metrique_core::CloseValue;
 
-    use super::State;
+    use super::{State, StateRef};
 
     #[derive(Clone, Debug)]
     struct Closeable;
@@ -226,7 +360,6 @@ mod tests {
         let x = State::new(42u64);
         assert_eq!(*x.snapshot(), 42);
         x.store(Arc::new(100));
-        // Still returns the captured value.
         assert_eq!(*x.snapshot(), 42);
     }
 
@@ -242,9 +375,7 @@ mod tests {
         let x = State::new(42u64);
         x.snapshot();
         x.store(Arc::new(100));
-        // Snapshot is unchanged.
         assert_eq!(*x.snapshot(), 42);
-        // But a fresh clone sees the new value.
         assert_eq!(*x.clone().snapshot(), 100);
     }
 
@@ -258,14 +389,13 @@ mod tests {
     #[test]
     fn clone_gets_fresh_snapshot() {
         let x = State::new(42u64);
-        x.snapshot(); // capture 42
+        x.snapshot();
 
         let writer = x.clone();
         writer.store(Arc::new(100));
 
         let reader = x.clone();
         assert_eq!(*reader.snapshot(), 100);
-        // Original still has 42.
         assert_eq!(*x.snapshot(), 42);
     }
 
@@ -292,5 +422,43 @@ mod tests {
         x.snapshot();
         let dbg = format!("{:?}", x);
         assert!(dbg.contains("snapshot"));
+    }
+
+    #[derive(Debug)]
+    struct NotClone(u64);
+    impl CloseValue for NotClone {
+        type Closed = u64;
+        fn close(self) -> u64 {
+            self.0
+        }
+    }
+    impl CloseValue for &'_ NotClone {
+        type Closed = u64;
+        fn close(self) -> u64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn state_ref_close_owned() {
+        let x = StateRef::new(NotClone(99));
+        assert_eq!(x.close(), 99);
+    }
+
+    #[test]
+    fn state_ref_close_ref() {
+        let x = StateRef::new(NotClone(99));
+        assert_eq!((&x).close(), 99);
+    }
+
+    #[test]
+    fn state_ref_snapshot() {
+        let x = StateRef::new(NotClone(1));
+        assert_eq!(x.snapshot().0, 1);
+        x.store(Arc::new(NotClone(2)));
+        // Snapshot is pinned.
+        assert_eq!(x.snapshot().0, 1);
+        // Fresh clone sees new value.
+        assert_eq!(x.clone().snapshot().0, 2);
     }
 }

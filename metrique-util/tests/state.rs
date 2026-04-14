@@ -8,7 +8,7 @@ use std::sync::Arc;
 use metrique::unit_of_work::metrics;
 use metrique::writer::sink::VecEntrySink;
 use metrique::writer::test_util;
-use metrique_util::State;
+use metrique_util::{State, StateRef};
 
 #[derive(Clone, Debug, Default)]
 #[metrics(subfield)]
@@ -242,4 +242,83 @@ async fn state_spawned_tasks_across_config_reload() {
     let e3 = test_util::to_test_entry(&entries[2]);
     assert_eq!(e3.values["Operation"], "DeleteItem");
     assert_eq!(e3.metrics["FeatureXyzEnabled"], 1);
+}
+
+/// StateRef<T> works with non-Clone types containing OnceLock for progressive population.
+/// This is the motivating use case for issue #263.
+#[test]
+fn state_ref_with_oncelock_progressive_population() {
+    use std::sync::OnceLock;
+
+    #[metrics(subfield)]
+    struct Environment {
+        feature_flag: bool,
+        resolved_region: OnceLock<&'static str>,
+    }
+
+    #[metrics(rename_all = "PascalCase")]
+    struct Metrics {
+        operation: &'static str,
+        #[metrics(flatten)]
+        env: StateRef<Environment>,
+    }
+
+    let vec_sink = VecEntrySink::new();
+
+    let state = StateRef::new(Environment {
+        feature_flag: true,
+        resolved_region: OnceLock::new(),
+    });
+
+    // Simulate background work progressively populating the OnceLock
+    // through the shared Arc.
+    state.snapshot().resolved_region.set("us-east-1").unwrap();
+
+    let metrics = Metrics {
+        operation: "GetItem",
+        env: state,
+    }
+    .append_on_drop(vec_sink.clone());
+    drop(metrics);
+
+    let entries = vec_sink.drain();
+    assert_eq!(entries.len(), 1);
+    let entry = test_util::to_test_entry(&entries[0]);
+    assert_eq!(entry.values["Operation"], "GetItem");
+    assert_eq!(entry.metrics["FeatureFlag"], 1);
+    assert_eq!(entry.values["ResolvedRegion"], "us-east-1");
+}
+
+/// OnceLock fields left unset at emission time close as None (omitted from output).
+#[test]
+fn state_ref_unset_oncelock_emits_none() {
+    use std::sync::OnceLock;
+
+    #[metrics(subfield)]
+    struct Environment {
+        resolved_region: OnceLock<&'static str>,
+    }
+
+    #[metrics(rename_all = "PascalCase")]
+    struct Metrics {
+        #[metrics(flatten)]
+        env: StateRef<Environment>,
+    }
+
+    let vec_sink = VecEntrySink::new();
+
+    let metrics = Metrics {
+        env: StateRef::new(Environment {
+            resolved_region: OnceLock::new(),
+        }),
+    }
+    .append_on_drop(vec_sink.clone());
+    drop(metrics);
+
+    let entries = vec_sink.drain();
+    assert_eq!(entries.len(), 1);
+    let entry = test_util::to_test_entry(&entries[0]);
+    // Unset OnceLock should not appear in the emitted entry.
+    assert!(!entry.values.contains_key("ResolvedRegion"));
+    assert!(!entry.metrics.contains_key("ResolvedRegion"));
 }
