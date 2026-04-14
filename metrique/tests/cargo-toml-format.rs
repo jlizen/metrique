@@ -35,18 +35,21 @@ fn test_cargo_toml_format(
                         toml_path.display()
                     )
                 });
-                assert!(
-                    dep_table.contains_key("path"),
-                    "metrique dependency '{}' in {} must have 'path' property to use crate from property",
-                    name,
-                    toml_path.display()
-                );
-                assert!(
-                    dep_table.contains_key("version"),
-                    "metrique dependency '{}' in {} must have a 'version' property to allow publishing",
-                    name,
-                    toml_path.display()
-                );
+                // workspace = true inherits path and version from [workspace.dependencies]
+                if !dep_table.contains_key("workspace") {
+                    assert!(
+                        dep_table.contains_key("path"),
+                        "metrique dependency '{}' in {} must have 'path' or 'workspace' property",
+                        name,
+                        toml_path.display()
+                    );
+                    assert!(
+                        dep_table.contains_key("version"),
+                        "metrique dependency '{}' in {} must have a 'version' or 'workspace' property to allow publishing",
+                        name,
+                        toml_path.display()
+                    );
+                }
             }
         }
     }
@@ -61,18 +64,21 @@ fn test_cargo_toml_format(
                         toml_path.display()
                     )
                 });
-                assert!(
-                    dep_table.contains_key("path"),
-                    "metrique dependency '{}' in {} must have 'path' property to use crate from property",
-                    name,
-                    toml_path.display()
-                );
-                assert!(
-                    !dep_table.contains_key("version"),
-                    "metrique dependency '{}' in {} must not use the 'version' property to prevent chicken-and-egg problems",
-                    name,
-                    toml_path.display()
-                );
+                // workspace = true inherits path from [workspace.dependencies]
+                if !dep_table.contains_key("workspace") {
+                    assert!(
+                        dep_table.contains_key("path"),
+                        "metrique dependency '{}' in {} must have 'path' or 'workspace' property",
+                        name,
+                        toml_path.display()
+                    );
+                    assert!(
+                        !dep_table.contains_key("version"),
+                        "metrique dependency '{}' in {} must not use the 'version' property to prevent chicken-and-egg problems",
+                        name,
+                        toml_path.display()
+                    );
+                }
             }
         }
     }

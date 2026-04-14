@@ -18,11 +18,11 @@ tokio = { workspace = true, optional = true, features = ["rt"] }
 
 [dev-dependencies]
 assert-json-diff = { workspace = true }
-metrique = { path = "../metrique", features = [] }
-metrique-writer = { path = "../metrique-writer", features = ["tracing-subscriber-03", "test-util"] }
+metrique = { workspace = true, features = [] }
+metrique-writer = { workspace = true, features = ["tracing-subscriber-03", "test-util"] }
 metrique-writer-core = { path = ".", features = ["test-util"] }
 tracing-appender = { workspace = true }
-metrique-writer-format-emf = { path = "../metrique-writer-format-emf" }
+metrique-writer-format-emf = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

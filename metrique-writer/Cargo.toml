@@ -26,22 +26,22 @@ tokio = { workspace = true, optional = true, default-features = false, features 
 tracing = { workspace = true, optional = true }
 metrics_024 = { workspace = true, optional = true }
 metrics-util_020 = { workspace = true, optional = true }
-metrique-writer-core = { path = "../metrique-writer-core", version = "0.1.15" }
-metrique-writer-macro = { path = "../metrique-writer-macro", version = "0.1.8" }
-metrique-core = { path = "../metrique-core", version = "0.1.19" }
+metrique-writer-core = { workspace = true, features = ["serde"] }
+metrique-writer-macro = { workspace = true }
+metrique-core = { workspace = true }
 ordered-float = { workspace = true, optional = true }
 
 [dev-dependencies]
 enum-map = { workspace = true }
 strum_macros = { workspace = true }
-metrique-writer-core = { path = "../metrique-writer-core", features = [
+metrique-writer-core = { workspace = true, features = [
     "private-test-util",
     "test-util",
 ] }
-metrique-writer = { path = "../metrique-writer", features = ["test-util"] }
-metrique-writer-format-emf = { path = "../metrique-writer-format-emf" }
-metrique-metricsrs = { path = "../metrique-metricsrs" }
-metrique = { path = "../metrique" }
+metrique-writer = { path = ".", features = ["test-util"] }
+metrique-writer-format-emf = { workspace = true }
+metrique-metricsrs = { workspace = true }
+metrique = { workspace = true, features = ["service-metrics"] }
 metrics-util_020 = { workspace = true, features = ["debugging"] }
 futures = { workspace = true, features = ["executor"] }
 tokio = { workspace = true, features = ["macros", "test-util"] }

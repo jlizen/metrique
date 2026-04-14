@@ -21,9 +21,9 @@ histogram = { workspace = true }
 pin-project = { workspace = true }
 metrics_024 = { workspace = true, optional = true }
 metrics-util_020 = { workspace = true, optional = true }
-metrique-writer-core = { path = "../metrique-writer-core", version = "0.1.15", default-features = false }
-metrique-writer = { path = "../metrique-writer", version = "0.1.21", default-features = false }
-metrique-timesource = { path = "../metrique-timesource", version = "0.1.9" }
+metrique-writer-core = { workspace = true }
+metrique-writer = { workspace = true }
+metrique-timesource = { workspace = true }
 futures = { workspace = true, default-features = false, features = ["executor"] }
 tokio = { workspace = true, default-features = false, features = [
     "sync", "time"
@@ -35,15 +35,15 @@ tracing-appender = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-appender = { workspace = true }
-metrique = { path = "../metrique", features = ["service-metrics"] }
-metrique-timesource = { path = "../metrique-timesource", features = [
+metrique = { workspace = true, features = ["service-metrics"] }
+metrique-timesource = { workspace = true, features = [
     "custom-timesource",
     "tokio",
     "test-util",
 ] }
-metrique-writer = { path = "../metrique-writer", features = ["test-util"] }
-metrique-writer-core = { path = "../metrique-writer-core", features = ["private-test-util"] }
-metrique-writer-format-emf = { path = "../metrique-writer-format-emf" }
+metrique-writer = { workspace = true, features = ["test-util"] }
+metrique-writer-core = { workspace = true, features = ["private-test-util"] }
+metrique-writer-format-emf = { workspace = true }
 metrique-metricsrs = { path = ".", features = ["metrics-rs-024", "test-util"] }
 tokio = { workspace = true, features = ["macros", "test-util"] }
 rand = { workspace = true }
