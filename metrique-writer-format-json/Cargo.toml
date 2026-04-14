@@ -12,12 +12,12 @@ readme = "README.md"
 itoa = { workspace = true }
 dtoa = { workspace = true }
 rand = { workspace = true }
-metrique-writer-core = { path = "../metrique-writer-core", version = "0.1.15" }
-metrique-writer = { path = "../metrique-writer", version = "0.1.21" }
+metrique-writer-core = { workspace = true, features = ["serde"] }
+metrique-writer = { workspace = true, features = ["background-queue", "tracing-subscriber-03", "metrics-rs-024"] }
 
 [dev-dependencies]
-metrique-writer-core = { path = "../metrique-writer-core", features = ["private-test-util"] }
-metrique-writer = { path = "../metrique-writer", features = ["test-util"] }
+metrique-writer-core = { workspace = true, features = ["private-test-util"] }
+metrique-writer = { workspace = true, features = ["test-util"] }
 rand_chacha = { workspace = true }
 serde_json = { workspace = true }
 

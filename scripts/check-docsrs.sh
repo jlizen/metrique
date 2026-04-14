@@ -72,6 +72,17 @@ check_package() {
         # Patch the extracted Cargo.toml so workspace siblings resolve locally.
         generate_patch_entries "$pkg_name" >> "$pkg_dir/Cargo.toml"
 
+        # Redirect the workspace dependency for this package to the packaged
+        # copy so siblings with `workspace = true` deps resolve there instead
+        # of the workspace path (avoids lockfile collisions).
+        local abs_pkg_dir
+        abs_pkg_dir=$(realpath "$pkg_dir")
+        cp Cargo.toml Cargo.toml.bak
+        sed -i "s|^\(${pkg_name} = {.*version.*path = \"\)[^\"]*|\1${abs_pkg_dir}|" Cargo.toml
+        # Remove from workspace members so Cargo doesn't discover the original
+        # alongside the redirected workspace dep.
+        sed -i "/\"${pkg_name}\",/d" Cargo.toml
+
         # Restore doc-scrape-examples = true that cargo package strips.
         local source_toml
         source_toml=$(cargo metadata --no-deps --format-version 1 | \
@@ -79,6 +90,9 @@ check_package() {
         restore_doc_scrape_examples "$source_toml" "$pkg_dir/Cargo.toml"
 
         (cd "$pkg_dir" && cargo +nightly docs-rs --target "$TARGET")
+
+        # Restore workspace Cargo.toml.
+        mv Cargo.toml.bak Cargo.toml
         return
     fi
 
