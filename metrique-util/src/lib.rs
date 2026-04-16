@@ -18,3 +18,9 @@ mod tokio_metrics_reporter;
 pub use tokio_metrics_reporter::{
     AttachGlobalEntrySinkTokioMetricsExt, MetricNameStyle, TokioRuntimeMetricsConfig,
 };
+
+#[cfg(feature = "pending-sink")]
+#[cfg_attr(docsrs, doc(cfg(feature = "pending-sink")))]
+pub mod pending_sink;
+#[cfg(feature = "pending-sink")]
+pub use pending_sink::PendingSinkResolver;
