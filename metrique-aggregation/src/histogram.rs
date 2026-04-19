@@ -187,11 +187,9 @@ impl<T, S: AggregationStrategy> Histogram<T, S> {
                     match obs {
                         Observation::Unsigned(v) => self.0.record(v as f64),
                         Observation::Floating(v) => self.0.record(v),
-                        Observation::Repeated { total, occurrences } => {
-                            if occurrences > 0 {
-                                let avg = total / occurrences as f64;
-                                self.0.record_many(avg, occurrences);
-                            }
+                        Observation::Repeated { total, occurrences } if occurrences > 0 => {
+                            let avg = total / occurrences as f64;
+                            self.0.record_many(avg, occurrences);
                         }
                         _ => {}
                     }
@@ -271,11 +269,9 @@ impl<T, S: SharedAggregationStrategy> SharedHistogram<T, S> {
                     match obs {
                         Observation::Unsigned(v) => self.0.record(v as f64),
                         Observation::Floating(v) => self.0.record(v),
-                        Observation::Repeated { total, occurrences } => {
-                            if occurrences > 0 {
-                                let avg = total / occurrences as f64;
-                                self.0.record_many(avg, occurrences);
-                            }
+                        Observation::Repeated { total, occurrences } if occurrences > 0 => {
+                            let avg = total / occurrences as f64;
+                            self.0.record_many(avg, occurrences);
                         }
                         _ => {}
                     }
@@ -540,12 +536,10 @@ where
     fn insert(accum: &mut Self::Aggregated, value: HistogramClosed<T>) {
         for obs in value.observations {
             match obs {
-                Observation::Repeated { total, occurrences } => {
-                    if occurrences > 0 {
-                        accum
-                            .strategy
-                            .record_many(total / occurrences as f64, occurrences);
-                    }
+                Observation::Repeated { total, occurrences } if occurrences > 0 => {
+                    accum
+                        .strategy
+                        .record_many(total / occurrences as f64, occurrences);
                 }
                 Observation::Unsigned(v) => accum.strategy.record(v as f64),
                 Observation::Floating(v) => accum.strategy.record(v),
