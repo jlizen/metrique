@@ -309,9 +309,7 @@ impl ValueWriter for FieldValueWriter<'_> {
                     value: v,
                     weight: 1,
                 }),
-                Observation::Repeated { total, occurrences }
-                    if occurrences > 0 =>
-                {
+                Observation::Repeated { total, occurrences } if occurrences > 0 => {
                     // Repeated observations represent `occurrences` samples that sum
                     // to `total`. We store the average with the full weight so
                     // percentile computation accounts for the count without
