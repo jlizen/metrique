@@ -309,17 +309,17 @@ impl ValueWriter for FieldValueWriter<'_> {
                     value: v,
                     weight: 1,
                 }),
-                Observation::Repeated { total, occurrences } => {
-                    if occurrences > 0 {
-                        // Repeated observations represent `occurrences` samples that sum
-                        // to `total`. We store the average with the full weight so
-                        // percentile computation accounts for the count without
-                        // allocating one entry per occurrence.
-                        observations.push(WeightedObservation {
-                            value: total / occurrences as f64,
-                            weight: occurrences,
-                        });
-                    }
+                Observation::Repeated { total, occurrences }
+                    if occurrences > 0 =>
+                {
+                    // Repeated observations represent `occurrences` samples that sum
+                    // to `total`. We store the average with the full weight so
+                    // percentile computation accounts for the count without
+                    // allocating one entry per occurrence.
+                    observations.push(WeightedObservation {
+                        value: total / occurrences as f64,
+                        weight: occurrences,
+                    });
                 }
                 // Observation is #[non_exhaustive]; unknown variants are intentionally
                 // skipped — this is a best-effort debug format, not a lossless serializer.
