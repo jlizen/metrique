@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.25](https://github.com/awslabs/metrique/compare/metrique-v0.1.24...metrique-v0.1.25) - 2026-04-20
+
+### Added
+
+- `pending_sink` in `metrique-util` (feature: `pending-sink`): deferred sink attachment with bounded buffering. ([#275](https://github.com/awslabs/metrique/pull/275))
+  - Emit metrics immediately during startup while the real sink initializes asynchronously.
+  - Entries buffer in a lock-free ring buffer; oldest dropped when full.
+  - `resolver.resolve(real_sink)` drains the buffer and switches to direct forwarding.
+
+  ```rust
+  use metrique_util::pending_sink;
+
+  // Create a pending sink that buffers up to 1024 entries.
+  let (sink, resolver) = pending_sink::new(1024);
+
+  // Attach immediately so metrics start buffering during startup.
+  let _handle = ServiceMetrics::attach((sink, ()));
+
+  // Later, once the real sink is ready (after async init, credential
+  // exchange, etc.):
+  resolver.resolve(real_sink);
+  // Buffered entries drain into the real sink; future appends go direct.
+  ```
+
+### Other
+
+- Fix audit ([#276](https://github.com/awslabs/metrique/pull/276))
+- reframe terminology to lead with "wide events" ([#273](https://github.com/awslabs/metrique/pull/273))
+- use workspace dependencies for inter-crate deps ([#271](https://github.com/awslabs/metrique/pull/271))
+
 ## [0.1.24](https://github.com/awslabs/metrique/compare/metrique-v0.1.23...metrique-v0.1.24) - 2026-04-13
 
 ### Added
