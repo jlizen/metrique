@@ -8,7 +8,7 @@ Three pieces:
 - A **source** system that lets entries declare structural capabilities (timestamps, ids, etc.) and lets sinks extract typed snapshots from the closed entry.
 - A **field tag** system that lets sinks define their own opt-in tags and lets users apply them at struct or field scope.
 
-Plus a narrow `no_emit` attribute for fields that must participate in close but not in normal emission.
+Plus a narrow `no_write` attribute for fields that must participate in close but not in normal emission.
 
 ## What it enables
 
@@ -38,7 +38,7 @@ struct RequestAudit { /* ... */ }
 
 #[metrics(default_field_tag(audit::Export))]
 struct RequestMetrics {
-    #[metrics(no_emit)]
+    #[metrics(no_write)]
     audit: RequestAudit,
 
     operation: &'static str,
@@ -59,12 +59,14 @@ audit::close_event();
 ## The descriptor model
 
 ```rust
+#[non_exhaustive]
 pub struct EntryDescriptor {
     pub fields: &'static [FieldDescriptor],
     pub sources: &'static [SourceDescriptor],
     pub source_extractors: &'static [SourceExtractor],
 }
 
+#[non_exhaustive]
 pub struct FieldDescriptor {
     pub name: &'static str,
     pub tags: &'static [ResolvedFieldTag],
@@ -72,15 +74,43 @@ pub struct FieldDescriptor {
     pub unit: Option<Unit>,
 }
 
+#[non_exhaustive]
 pub enum FieldShape {
     Known(KnownShape),
     Optional(&'static FieldShape),
     Flex { key: StringShape, value: &'static FieldShape },
     Opaque,
 }
+
+#[non_exhaustive]
+pub enum KnownShape {
+    Bool,
+    I64,
+    U64,
+    F64,
+    String,
+    Bytes,
+    // future metrique scalars (Duration subtypes, timestamps, etc.) go here
+}
+
+#[non_exhaustive]
+pub enum StringShape {
+    String,
+    // future string variants (cow, interned, etc.) go here
+}
 ```
 
 `FieldShape` describes the closed/emitted shape, not the raw Rust field type. `Timer` lowers to `Known(U64)`; `Option<Duration>` to `Optional(Known(U64))`; `Flex<(String, u64)>` to `Flex { key: String, value: Known(U64) }`.
+
+`Known(KnownShape)` covers scalar types metrique understands intrinsically. Macro-generated `#[metrics(value)]` newtypes over a known scalar lower to the wrapped scalar's shape. User-written `Value` impls that metrique cannot inspect (a bare `impl Value for MyType`) lower to `FieldShape::Opaque`: the sink knows the field is emitted but cannot predict its wire shape.
+
+Because the descriptor is `#[non_exhaustive]` all the way through, future metrique versions can add `KnownShape` variants without breaking hand-written `DescribeEntry` implementors, and new descriptor-aware sinks can introspect older descriptors without compilation breaks.
+
+### The Opaque trapdoor
+
+A field whose closed shape is `FieldShape::Opaque` is fully functional through `Entry::write` (every `Value` impl works; EMF and JSON handle it fine), but descriptor-aware sinks that selected it via a tag have no wire-level shape guarantee for it. Typical sinks skip opaque fields with a diagnostic and continue. This is the price of letting user types implement `Value` without a parallel descriptor hook.
+
+Users who want custom types to flow through descriptor-aware sinks should either use `#[metrics(value)]` (which lowers to a `Known` shape) or wait for the deferred `DescribeValue` extension.
 
 The descriptor is a `'static` constant. Sinks can cache anything derived from it keyed on the pointer.
 
@@ -134,12 +164,12 @@ struct RequestAudit { /* ... */ }
 The generated implementation is an extractor against the closed value:
 
 ```rust
-pub trait Source<C> {
+pub trait Extractable<C> {
     type Snapshot;
     fn snapshot(&self) -> Self::Snapshot;
 }
 
-impl Source<audit::RequestContext> for ClosedRequestAudit {
+impl Extractable<audit::RequestContext> for ClosedRequestAudit {
     type Snapshot = audit::RequestCtx;
     fn snapshot(&self) -> audit::RequestCtx { /* … */ }
 }
@@ -150,7 +180,7 @@ Sinks look sources up by tag through the descriptor and call the extractor on th
 An ad-hoc field form is supported as an escape hatch for types that do not self-describe as a source:
 
 ```rust
-#[metrics(source(audit::RequestContext), no_emit)]
+#[metrics(source(audit::RequestContext), no_write)]
 ctx: MyAdHocContext,
 ```
 
@@ -161,55 +191,57 @@ Prefer self-describing source types where possible.
 Every type used as a source tag (the `C` in `source(C)`) must implement `SourceTag`:
 
 ```rust
-pub trait SourceTag: Any + Send + Sync + 'static {
-    /// Called once per distinct `&'static EntryDescriptor` that declares
-    /// `source(Self)`. Fires before `main` via link-time registration.
-    /// Default is a no-op.
-    fn register_descriptor(_desc: &'static EntryDescriptor) {}
-}
+pub trait SourceTag: Any + Send + Sync + 'static {}
 ```
 
-The trait is small on purpose:
-
-- **As a marker**, it identifies types that can legitimately be used as source tags, catching typos at the macro boundary.
-- **As a hook**, it lets sinks that want binary-wide startup-time discovery populate their own registry. Sinks that do not care leave the method defaulted; no code runs.
-
-Default `impl` makes adoption trivial:
+It is a pure marker. Implementing it is a one-line impl with no boilerplate:
 
 ```rust
 impl metrique::SourceTag for audit::RequestContext {}
 ```
 
-An opt-in sink implements the method:
+The marker catches typos at the macro boundary (`source(T)` where `T` is not a `SourceTag` is a trait-bound error) and carries no runtime cost. Sinks that want nothing more stop here.
+
+### Opting into binary-wide discovery
+
+Sinks that want to learn "every struct in this binary declaring `source(Self)`" (to validate early, build a registry, warn on empty, etc.) additionally implement `DiscoverableSourceTag`:
+
+```rust
+pub trait DiscoverableSourceTag: SourceTag {
+    fn register_descriptor(registration: SourceRegistration<'static>);
+}
+
+#[non_exhaustive]
+pub struct SourceRegistration<'a> {
+    pub descriptor: &'a EntryDescriptor,
+    // room for future fields
+}
+```
+
+`register_descriptor` is called once per distinct `&'static EntryDescriptor` that declares `source(Self)`, before `main`, via link-time registration emitted by the metrique macro. How that registration is plumbed under the hood (`linkme`, `ctor`, a future stable mechanism) is an implementation detail.
+
+A sink that wants a binary-wide registry implements both traits:
 
 ```rust
 static AUDIT_DESCRIPTORS: Lazy<Mutex<Vec<&'static EntryDescriptor>>>
     = Lazy::new(|| Mutex::new(Vec::new()));
 
-impl metrique::SourceTag for audit::RequestContext {
-    fn register_descriptor(desc: &'static EntryDescriptor) {
-        AUDIT_DESCRIPTORS.lock().unwrap().push(desc);
+impl metrique::SourceTag for audit::RequestContext {}
+
+impl metrique::DiscoverableSourceTag for audit::RequestContext {
+    fn register_descriptor(reg: metrique::SourceRegistration<'static>) {
+        AUDIT_DESCRIPTORS.lock().unwrap().push(reg.descriptor);
     }
 }
 ```
 
-How registration is plumbed under the hood (pre-main execution via `ctor`, distributed slices via `linkme`, or a future stable mechanism) is an implementation detail; the public contract is the trait. Sinks can swap the backing mechanism independently.
+Sinks that implement only `SourceTag` (not `DiscoverableSourceTag`) emit no link-time registrations. Their binary has no per-source registration statics and no `linkme` machinery; they pay literally nothing. Sinks that opt into discovery pay one `&'static` pointer per `source(Self)` declaration per descriptor.
 
-## `no_emit`
+## `no_write`
 
-```text
-constructed                yes
-closed                     yes
-retained                   yes
-source-extractable         yes
-emitted via Entry::write   no
-```
+Sources are ordinary metrique fields and structs. They close, they live on the closed entry, and by default they emit through `Entry::write` like anything else. Users often `flatten` a source struct or leave it as a regular field if its data is also useful as normal payload.
 
-Distinct from `ignore`, which excludes the field from metrics machinery entirely. `no_emit` keeps the field in the closed entry so source extractors (and any future mechanism that reads closed state) can see it.
-
-`no_emit` is primarily reached for when the field exists to provide a source. Source fields do not have to be `no_emit`: if the context data is also useful as normal payload, users typically either leave it as a regular emitted field or attach `#[metrics(flatten)]` so its inner fields become part of the parent entry. `no_emit` is the right choice only when the data must survive close but should not appear in normal emission.
-
-`no_emit` is mutually exclusive with `flatten`.
+`no_write` is the opt-out: a field attribute that retains the field in the closed entry (so source extractors can still see it) while excluding it from `Entry::write`. Use it when the data must survive close but should not appear in normal emission. `no_write` is distinct from `ignore`, which excludes the field from metrics machinery entirely.
 
 ## Architecture
 
@@ -220,7 +252,7 @@ Distinct from `ignore`, which excludes the field from metrics machinery entirely
 │ For each macro-derived entry:                               │
 │   impl Entry for ClosedX (as today)                         │
 │   static EntryDescriptor                                    │
-│   impl Source<C> for ClosedX (per declared source)          │
+│   impl Extractable<C> for ClosedX (per declared source)          │
 │   descriptor() hook on the erased entry vtable              │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -237,7 +269,7 @@ Distinct from `ignore`, which excludes the field from metrics machinery entirely
 │ RUNTIME: append-on-drop / close                             │
 │                                                             │
 │ CloseValue closes all fields.                               │
-│ no_emit fields are retained on the closed entry and remain  │
+│ no_write fields are retained on the closed entry and remain  │
 │ reachable to source extractors.                             │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -339,7 +371,7 @@ The checks run once per descriptor (caching on the `&'static` pointer). The sink
 
 ### Startup-time (binary-wide, opt-in per sink)
 
-Sinks that want to catch "the sink is attached but no compatible entry types exist in this binary" can use the `SourceTag::register_descriptor` hook. When a sink overrides the hook, every macro-derived descriptor that declares `source(Self)` is registered in whatever store the sink chooses, before `main`. At sink construction, the sink inspects its store and emits a warning (or other signal) if nothing is registered.
+Sinks that want to catch "the sink is attached but no compatible entry types exist in this binary" implement `DiscoverableSourceTag` and override `register_descriptor`. When a sink provides that impl, every macro-derived descriptor declaring `source(Self)` is registered in whatever store the sink chooses, before `main`. At sink construction, the sink inspects its store and emits a warning (or other signal) if nothing is registered. Sinks that implement only the `SourceTag` marker pay nothing.
 
 This pattern is opt-in for sinks and entirely transparent to end users. Sinks that do not care leave the hook defaulted; metrique emits registration calls regardless, but the default implementation is a no-op and the compiler inlines it away.
 
