@@ -259,9 +259,13 @@ FieldShape::Flex {
 
 One descriptor field regardless of runtime key cardinality. Sinks that understand `Flex` can register one schema; sinks that do not can walk the per-key emissions that `Entry::write` already produces.
 
-## Compile-time validation
+## Validation
 
-Examples the macro can reject statically:
+Validation happens in two places. The macro catches everything it can see without knowing what a tag "means"; a sink catches everything that requires interpreting its own tags.
+
+### Compile-time (at macro expansion)
+
+Intrinsic to the system and independent of any specific sink:
 
 ```rust
 // duplicate source tag on the same entry
@@ -275,14 +279,39 @@ struct Bad;
 request_id: String,
 // -> error: conflicting field tags
 
-// field tagged with a sink's tag but no matching source on the entry
-#[metrics(default_field_tag(audit::Export))]
-struct NoCtx { id: String }
-// -> error if the audit sink declares that its tag requires its source
-//    (opt-in, sink-driven diagnostic; the macro treats tag identity opaquely)
+// default_field_tag(T) and default_field_tag(skip(T)) on the same struct
+#[metrics(default_field_tag(audit::Export), default_field_tag(skip(audit::Export)))]
+struct Bad;
+// -> error: conflicting defaults
+
+// unknown attribute argument form
+#[metrics(field_tag(audit::Export, extra))]
+// -> error: unexpected token
 ```
 
-Sink-specific diagnostics (e.g. `InternString` on a non-string field, an opaque value selected for a sink tag) are follow-on extensions. The descriptor carries enough information for the sink itself to produce an equivalent diagnostic at runtime.
+Opt-in, sink-driven compile-time checks are possible when a sink ships a helper that the user invokes alongside `#[metrics(...)]`. Those checks run against the descriptor the macro emits; the macro itself does not understand tag identity beyond equality, so it cannot enforce relationships between tags without sink-side help. That is a design choice, not a limitation: it keeps tag ownership in the sink crate.
+
+Examples a sink-side helper could catch:
+
+- A field tagged with the sink's tag but the entry declares no matching source.
+- A sink-specific tag (e.g. `InternString`) applied to a field whose closed shape cannot carry string data.
+- A value with `FieldShape::Opaque` selected for a tag whose wire format needs a known shape.
+
+### Runtime (at the sink)
+
+Descriptor-aware sinks can repeat any of the sink-driven checks above at startup or on first use of a descriptor, using the static `EntryDescriptor`. Because descriptors are `'static`, these checks can be memoised per descriptor pointer:
+
+- Walk `desc.fields`; confirm that any field tagged with the sink's tag has a shape the sink knows how to encode.
+- Walk `desc.sources`; confirm the tags the sink requires are present.
+- Cache the verdict. Subsequent entries of the same type pay nothing.
+
+Failures here are reported, not crashed. A tagged field with an opaque shape is skipped on the wire (with a rate-limited log); an entry missing a required source is dropped (with a rate-limited log per descriptor). The rest of the sink continues.
+
+### What is not validated
+
+- **Tag semantics across crates.** The macro cannot know that `alice::X` and `bob::X` in different crates "mean the same thing." Tag identity is nominal.
+- **Cross-entry invariants.** The descriptor describes one entry type. Relationships between entries (e.g. "every request start has a corresponding request end") are a sink concern.
+- **Value validity.** Whether a field's value is in range, non-empty, etc., is outside this system; metrique's normal value validation applies.
 
 ## Future evolution
 

@@ -56,6 +56,19 @@ The design had to meet all of these.
 - **Flex lowers to `map<string, T>` only.** Current metrique Flex is `Flex<(String, T)>`. The descriptor reflects that exactly. Heterogeneous or multi-level dynamic maps would need a richer shape language; the design deliberately does not pay that cost now.
 - **Descriptor lookup through the erased vtable.** We extend the erased entry trait object with one new method (`descriptor()`), returning `Option<&'static EntryDescriptor>`. That is a one-time surface change to the trait object; after that, `BoxEntry` size is unchanged and descriptor-unaware sinks never call the new method.
 
+## Why this combination of pieces
+
+Each of descriptors, sources, field tags, and `no_emit` is necessary; together they are the smallest set that covers the requirements.
+
+- **Descriptors alone** give sinks a structural view but do not solve caller-thread capture. Context would still have to ride in an `EntryConfig` from a sink wrapper, which brings back the privileged-sink problem. Descriptors also do not let users turn fields on or off per sink; every descriptor-aware sink would see every field.
+- **Sources alone** give typed context extraction but no way to describe the rest of the entry. A schema-registering sink still has to walk `Entry::write` and fingerprint, which reintroduces optional-field and Flex explosion.
+- **Field tags alone** give per-sink opt-in but no way to enumerate all possible fields (so optional-field schema explosion is still present) and no way to pull structural context out of a closed entry.
+- **`no_emit` alone** is not a separate feature; it exists so that source-bearing fields can survive close without polluting normal emission. Without `no_emit`, users would have to choose between "source is visible as payload" (sometimes wrong) and "source is not available to the sink" (always wrong).
+
+The combination is minimal in another sense: it reuses existing metrique abstractions (`Entry::write`, `CloseValue`, `BoxEntry`, `EntryConfig`) without changing any of them. Descriptors describe the existing closed shape; sources are plain fields with a typed extractor; field tags are opaque markers the macro records; `no_emit` is the one new lifecycle annotation. Nothing forces existing users to change, and descriptor-unaware sinks never touch any of it.
+
+None of the four pieces is redundant: removing any one of them forces callers back to a mechanism the design was built to replace.
+
 ## Field tag resolution: full rules
 
 Each `(field, tag)` pair resolves to one of `unspecified`, `present`, `absent`.
