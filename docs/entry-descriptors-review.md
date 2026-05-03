@@ -69,6 +69,98 @@ The combination is minimal in another sense: it reuses existing metrique abstrac
 
 None of the four pieces is redundant: removing any one of them forces callers back to a mechanism the design was built to replace.
 
+## Hand-written `Entry` impls
+
+`#[metrics(...)]` is a convenience. Users can and do write `impl Entry for MyType { fn write(...) { ... } }` directly, without any derive. The descriptor system has to have a story for them.
+
+### Today
+
+Hand-written `Entry` impls keep working unchanged on format-level sinks (EMF, JSON, anything that consumes `Entry::write`). Nothing the descriptor system introduces breaks that path.
+
+Descriptor-aware sinks see `descriptor() == None` on those entries. The default behaviour is skip with a rate-limited warn, keyed on `inner_any().type_id()` so each concrete hand-written type is reported at most a handful of times.
+
+### Opt-in path: manual `DescribeEntry`
+
+A user with a hand-rolled `Entry` can opt back in by implementing a second trait. Rough shape:
+
+```rust
+pub trait DescribeEntry: Entry {
+    const DESCRIPTOR: &'static EntryDescriptor;
+
+    // Type-erased source extraction. Given a type-id, return a boxed snapshot
+    // of the appropriate Snapshot type for that source.
+    fn extract_source(&self, tag: TypeId) -> Option<Box<dyn Any + Send>> {
+        let _ = tag;
+        None
+    }
+}
+
+// Blanket for descriptor lookup via the erased entry vtable:
+impl<T: Entry + DescribeEntry + Send + 'static> ErasedEntry for T {
+    fn descriptor(&self) -> Option<&'static EntryDescriptor> {
+        Some(T::DESCRIPTOR)
+    }
+    // ...
+}
+```
+
+A user implementation would look roughly like:
+
+```rust
+struct MyThing { request_id: String, latency_us: u64, /* ... */ }
+
+impl Entry for MyThing { fn write<'a>(&'a self, w: &mut impl EntryWriter<'a>) { /* ... */ } }
+
+impl DescribeEntry for MyThing {
+    const DESCRIPTOR: &'static EntryDescriptor = &EntryDescriptor {
+        fields: &[
+            FieldDescriptor {
+                name: "request_id",
+                tags: tags![ present(dial9::InTrace) ],
+                shape: FieldShape::Known(KnownShape::String),
+                unit: None,
+            },
+            FieldDescriptor {
+                name: "latency",
+                tags: tags![ present(dial9::InTrace) ],
+                shape: FieldShape::Known(KnownShape::U64),
+                unit: Some(Unit::Microsecond),
+            },
+        ],
+        sources: &[ SourceDescriptor { tag: tag_of::<dial9::Dial9>() } ],
+        source_extractors: &[ /* pointer to extract_source-style function */ ],
+    };
+
+    fn extract_source(&self, tag: TypeId) -> Option<Box<dyn Any + Send>> {
+        if tag == TypeId::of::<dial9::Dial9>() {
+            Some(Box::new(dial9::Dial9ContextSnapshot { /* ... */ }))
+        } else {
+            None
+        }
+    }
+}
+```
+
+With that impl in place, a hand-written entry participates in every descriptor-aware sink exactly as a macro-derived one does.
+
+### Design questions this raises
+
+Manual implementation is the actual load-bearing case, not derive sugar. Two constraints on the descriptor API follow from "must be constructible by hand in `const` context":
+
+1. **`ResolvedFieldTag` must have `const` constructors.** A user writing the tag array has to be able to say `present::<dial9::InTrace>()` or equivalent in a const. The macro type holding the resolved tags cannot hide behind private variants that only the macro can construct.
+2. **Source extraction must be expressible without macro-generated code.** The approach above (type-erased `extract_source` on the trait, typed extractors stored in the descriptor) is one way; a typed-function-pointer-per-source with a `TypeId` key is another. The review doc does not commit; both work. What matters is that whichever we pick, a hand-written user can populate it.
+
+These are the shape of the public API metrique will need. The macro becomes one implementor of the same public surface, not the only implementor.
+
+### Non-goals for hand-written impls
+
+- Auto-generated `DescribeEntry` from an `Entry` impl: not on the roadmap. The whole point of hand-written impls is that the user is declaring the shape themselves.
+- A runtime `Entry::write` fingerprinter as a fallback: not on the roadmap. It contradicts the design's central argument (that optional-field and Flex explosion is structural, not observable).
+
+### Interaction with `#[metrics]`
+
+Hand-written `DescribeEntry` and macro-derived `DescribeEntry` coexist in the same pipeline with no extra glue. A heterogeneous `BoxEntrySink` can carry both. A future extension could let users attach `#[metrics]` to a type that has a custom `Entry` impl to fill in the descriptor half automatically, but that is strictly sugar; the manual path is complete on its own.
+
 ## Field tag resolution: full rules
 
 Each `(field, tag)` pair resolves to one of `unspecified`, `present`, `absent`.
@@ -235,7 +327,7 @@ Proposed shape: sink learns the schema by walking `Entry::write` on each emissio
 
 Rejected as the primary mechanism because it structurally cannot solve optional-field schema explosion or unbounded Flex key sets. A realistic entry with several optional fields and a Flex map can produce many thousands of fingerprints. The cache ends up thrashing or bloating.
 
-Runtime discovery is not rejected as a fallback: sinks can still do it for hand-written entries that return `None` from `descriptor()`. The v1 implementation probably skips those entries rather than paying the fingerprint cost; the hook remains available.
+Runtime discovery is not precluded by the descriptor design: a sink that wants to pay the fingerprint cost for hand-written entries can still walk `Entry::write` itself. This design does not provide that path, and the "Hand-written `Entry` impls" section above explains why we chose not to.
 
 ## Feasibility checks
 

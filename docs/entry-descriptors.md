@@ -317,7 +317,7 @@ Failures here are reported, not crashed. A tagged field with an opaque shape is 
 
 Short list of things explicitly left out of the initial design that fit the system cleanly:
 
-- Hand-written `Entry` impls opting into descriptors.
+- Hand-written `Entry` impls opting into descriptors via a `DescribeEntry` trait users implement by hand; same mechanism macro-derived entries use internally.
 - Optional sources and multiple sources per tag.
 - Heterogeneous values inside `Flex`.
 - A compile-time generated per-sink wire plan, for sinks that want to skip runtime `Entry::write` dispatch entirely.
