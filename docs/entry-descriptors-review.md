@@ -161,6 +161,82 @@ These are the shape of the public API metrique will need. The macro becomes one 
 
 Hand-written `DescribeEntry` and macro-derived `DescribeEntry` coexist in the same pipeline with no extra glue. A heterogeneous `BoxEntrySink` can carry both. A future extension could let users attach `#[metrics]` to a type that has a custom `Entry` impl to fill in the descriptor half automatically, but that is strictly sugar; the manual path is complete on its own.
 
+## Startup-time discovery mechanism
+
+The `SourceTag` trait carries an optional hook, `register_descriptor(desc: &'static EntryDescriptor)`, that fires once per distinct descriptor declaring `source(Self)`. The default impl is a no-op; sinks that want binary-wide discovery override it.
+
+Several design questions drove the choice of this shape.
+
+### Why the trait has a hook at all
+
+Without a hook, sinks cannot detect "I am attached but no matching entries exist in this binary" until they observe live traffic, which has the "first entry doesn't have this tag, but the second one might" ambiguity. Binary-wide discovery requires some compile/link-time aggregation that only exists if the metrique macro emits it. Making that aggregation part of `SourceTag` is the minimal surface: one trait method, default no-op, used only by sinks that care.
+
+### Why a trait method instead of a typed distributed slice
+
+The shape we rejected:
+
+```rust
+pub trait SourceTag: Any + Send + Sync + 'static {
+    const SLICE: &'static linkme::DistributedSlice<[&'static EntryDescriptor]>;
+}
+```
+
+This puts `linkme` in metrique's public API. Any consumer of `SourceTag` has a transitive dependency on `linkme`'s type system. If `linkme` ever needs to be swapped for a future mechanism (stable Rust distributed slices, a different registration crate, etc.) every sink would have to update.
+
+The trait-method shape keeps `linkme` (or `ctor`, or whatever else) entirely inside metrique's and each sink's implementations. The public contract is a plain `fn`. Sinks and users can't tell what metrique's macro uses internally.
+
+### Why a method instead of a plain marker trait
+
+The shape we also considered:
+
+```rust
+pub trait SourceTag: Any + Send + Sync + 'static {}
+```
+
+and then have sinks opt into discovery via a separate registration macro the user invokes per-struct. This reintroduces user ceremony, which the design rejects elsewhere, and it forces sinks that want discovery to own a public registration macro.
+
+The hook-on-trait path routes discovery through a single mechanism: the metrique macro emits registration for every `source(T)` declaration unconditionally; the trait method controls whether that registration is a no-op or does work.
+
+### Why the hook is defaulted rather than required
+
+A defaulted hook means every `SourceTag` impl is `impl SourceTag for T {}`, with no boilerplate, unless the sink actively wants discovery. Requiring an override would force every sink to write the method, including sinks that have no reason to care. The default-is-no-op shape is consistent with how metrique's other optional-override mechanisms work.
+
+### False-positive and false-negative enumeration
+
+Startup-time discovery reports "no entries registered for tag T" when it observes an empty registry at sink construction. The failure modes:
+
+**False negatives (registry empty, user thinks it should not be):**
+
+- Multi-binary workspace where the tagged entry lives in a different binary from the sink. The binary containing the sink genuinely has no registrations; the warn is technically correct but may surprise users thinking about their project holistically.
+- Exotic linker configurations that strip pre-main registration sections. Typical `cargo build` on tier-1 targets does not hit this.
+- Dynamically loaded libraries carrying the entries. Registrations from `dlopen`ed code may not reach the main binary's aggregation point.
+- Struct defined in a module that `rustc` DCEs entirely (e.g. feature-gated off). The macro never expands on the struct; no registration is emitted. Warn is correct in this case: the struct is not in the binary.
+
+**False positives (registry non-empty, user thinks it should be):**
+
+- A dependency ships its own tagged entries. The registry has entries from the dep even though the user added none of their own. Usually this is fine, since users who use dial9 generally want any dial9 telemetry to flow, but it can mask misconfigurations in the user's own code.
+- Test-only tagged entries in the same binary as production code that does not use them. Less common (test binaries and production binaries are separate in typical Cargo setups).
+
+Each sink should name its own FP/FN profile and expose an opt-out when the false-positive rate warrants it.
+
+### Why not use a metrique-provided registration macro
+
+Shape we considered: metrique ships `metrique::__register_source!` that sinks invoke from their own code to wire up a registry. The metrique macro, per source, emits `<TagCrate>::__metrique_register_descriptor!(&DESC, ...)`, delegating to a convention-named macro the sink crate must export.
+
+Rejected because it:
+
+- Forces every sink crate to define a macro with a specific name (magical by convention).
+- Cannot be enforced by the type system; missing macros produce ugly macro-resolution errors rather than trait bound errors.
+- Duplicates the trait-bound + trait-method shape for no gain.
+
+### Why not move registration to the descriptor pointer itself
+
+Shape we considered: the `EntryDescriptor` carries a list of function pointers (one per declared source) that register it. The metrique macro populates the list from the declared `source(T)` entries, and the descriptor's own static initializer runs the registrations.
+
+Rejected because it runs registration when the descriptor is first touched, not at program startup. That means sinks can't detect an empty registry reliably: until an entry actually emits, its descriptor is untouched, its registration has not fired, and the registry looks empty even if code for the struct exists.
+
+The `ctor`/`linkme`-backed pre-main path avoids this: registrations happen whether or not the struct is ever instantiated, as long as its code is in the binary.
+
 ## Field tag resolution: full rules
 
 Each `(field, tag)` pair resolves to one of `unspecified`, `present`, `absent`.
@@ -239,17 +315,21 @@ request_id: String,
 
 ## Validation catalogue
 
-These are the errors the macro can catch statically for macro-derived entries. Sink-specific variants depend on whether the sink exports its tag identities to the macro; if it does not, the diagnostic becomes a runtime report from the sink itself.
+Three phases. The macro catches structural errors it can see without understanding tag identity; the sink catches descriptor-local errors on first use; sinks that opt into startup-time discovery also catch binary-wide misconfigurations before traffic arrives.
 
-| Case | Static? |
+| Case | Phase |
 | --- | --- |
-| duplicate `source(T)` on the same entry | yes |
-| duplicate field-level `field_tag(T)` and `field_tag(skip(T))` | yes |
-| `no_emit` and `flatten` on the same field | yes |
-| `no_emit` on a field with no source on the type and no `source(...)` on the field | policy-dependent; see impl plan |
-| field tagged with a sink tag but the entry has no matching source | opt-in, sink-driven |
-| `InternString`-style tag on a non-string shape | opt-in, sink-driven |
-| value with `FieldShape::Opaque` selected for a sink tag | caught at sink-driven validation or at runtime by the sink |
+| duplicate `source(T)` on the same entry | macro (compile) |
+| duplicate field-level `field_tag(T)` and `field_tag(skip(T))` | macro (compile) |
+| conflicting `default_field_tag(T)` and `default_field_tag(skip(T))` on a struct | macro (compile) |
+| `no_emit` and `flatten` on the same field | macro (compile) |
+| `T` in `source(T)` does not implement `SourceTag` | macro (compile, trait bound) |
+| field tagged with a sink tag on an unsuitable `FieldShape` | sink first-use |
+| value with `FieldShape::Opaque` selected for a sink tag | sink first-use |
+| entry declares a tag requiring a source the entry does not provide | sink first-use |
+| sink attached in a binary with no registered entries for its source tag | sink startup (opt-in) |
+
+Sink-specific diagnostics (InternString on a non-string, etc.) depend on the sink's wire format and are not the macro's concern.
 
 ## Alternatives considered
 

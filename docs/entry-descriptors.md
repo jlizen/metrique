@@ -156,6 +156,45 @@ ctx: MyAdHocContext,
 
 Prefer self-describing source types where possible.
 
+### The `SourceTag` trait
+
+Every type used as a source tag (the `C` in `source(C)`) must implement `SourceTag`:
+
+```rust
+pub trait SourceTag: Any + Send + Sync + 'static {
+    /// Called once per distinct `&'static EntryDescriptor` that declares
+    /// `source(Self)`. Fires before `main` via link-time registration.
+    /// Default is a no-op.
+    fn register_descriptor(_desc: &'static EntryDescriptor) {}
+}
+```
+
+The trait is small on purpose:
+
+- **As a marker**, it identifies types that can legitimately be used as source tags, catching typos at the macro boundary.
+- **As a hook**, it lets sinks that want binary-wide startup-time discovery populate their own registry. Sinks that do not care leave the method defaulted; no code runs.
+
+Default `impl` makes adoption trivial:
+
+```rust
+impl metrique::SourceTag for audit::RequestContext {}
+```
+
+An opt-in sink implements the method:
+
+```rust
+static AUDIT_DESCRIPTORS: Lazy<Mutex<Vec<&'static EntryDescriptor>>>
+    = Lazy::new(|| Mutex::new(Vec::new()));
+
+impl metrique::SourceTag for audit::RequestContext {
+    fn register_descriptor(desc: &'static EntryDescriptor) {
+        AUDIT_DESCRIPTORS.lock().unwrap().push(desc);
+    }
+}
+```
+
+How registration is plumbed under the hood (pre-main execution via `ctor`, distributed slices via `linkme`, or a future stable mechanism) is an implementation detail; the public contract is the trait. Sinks can swap the backing mechanism independently.
+
 ## `no_emit`
 
 ```text
@@ -261,7 +300,7 @@ One descriptor field regardless of runtime key cardinality. Sinks that understan
 
 ## Validation
 
-Validation happens in two places. The macro catches everything it can see without knowing what a tag "means"; a sink catches everything that requires interpreting its own tags.
+Validation happens in three places, each catching a different class of error.
 
 ### Compile-time (at macro expansion)
 
@@ -284,28 +323,32 @@ request_id: String,
 struct Bad;
 // -> error: conflicting defaults
 
-// unknown attribute argument form
-#[metrics(field_tag(audit::Export, extra))]
-// -> error: unexpected token
+// source(T) where T does not implement SourceTag
+#[metrics(source(audit::NotATag))]
+struct Oops;
+// -> error: the trait bound `audit::NotATag: SourceTag` is not satisfied
 ```
 
-Opt-in, sink-driven compile-time checks are possible when a sink ships a helper that the user invokes alongside `#[metrics(...)]`. Those checks run against the descriptor the macro emits; the macro itself does not understand tag identity beyond equality, so it cannot enforce relationships between tags without sink-side help. That is a design choice, not a limitation: it keeps tag ownership in the sink crate.
+These are purely structural. The macro does not understand what tags mean; it catches only contradictions in the attributes themselves.
 
-Examples a sink-side helper could catch:
+### First-use (descriptor-local, per descriptor)
 
-- A field tagged with the sink's tag but the entry declares no matching source.
-- A sink-specific tag (e.g. `InternString`) applied to a field whose closed shape cannot carry string data.
-- A value with `FieldShape::Opaque` selected for a tag whose wire format needs a known shape.
+The first time a descriptor-aware sink encounters a given `&'static EntryDescriptor`, it can walk the descriptor for self-contradictions its own wire format does not support: a sink-specific field tag on an unsuitable `FieldShape`, a field tagged for emission whose closed shape is `Opaque`, a descriptor declaring entry-level tags that require a source the descriptor does not provide.
 
-### Runtime (at the sink)
+The checks run once per descriptor (caching on the `&'static` pointer). The sink decides the error policy: `debug_assert!` in debug builds, rate-limited log in release, or both.
 
-Descriptor-aware sinks can repeat any of the sink-driven checks above at startup or on first use of a descriptor, using the static `EntryDescriptor`. Because descriptors are `'static`, these checks can be memoised per descriptor pointer:
+### Startup-time (binary-wide, opt-in per sink)
 
-- Walk `desc.fields`; confirm that any field tagged with the sink's tag has a shape the sink knows how to encode.
-- Walk `desc.sources`; confirm the tags the sink requires are present.
-- Cache the verdict. Subsequent entries of the same type pay nothing.
+Sinks that want to catch "the sink is attached but no compatible entry types exist in this binary" can use the `SourceTag::register_descriptor` hook. When a sink overrides the hook, every macro-derived descriptor that declares `source(Self)` is registered in whatever store the sink chooses, before `main`. At sink construction, the sink inspects its store and emits a warning (or other signal) if nothing is registered.
 
-Failures here are reported, not crashed. A tagged field with an opaque shape is skipped on the wire (with a rate-limited log); an entry missing a required source is dropped (with a rate-limited log per descriptor). The rest of the sink continues.
+This pattern is opt-in for sinks and entirely transparent to end users. Sinks that do not care leave the hook defaulted; metrique emits registration calls regardless, but the default implementation is a no-op and the compiler inlines it away.
+
+Startup-time discovery has known false-positive and false-negative modes that each sink must document for its users:
+
+- **False negatives**: multi-binary workspaces where the entry-bearing struct lives in one binary and the sink lives in another; exotic build configurations that strip pre-main registration sections; dynamically loaded libraries.
+- **False positives**: a dependency that ships its own tagged entry types; test binaries that declare test-only tagged entries.
+
+Sinks with non-trivial FP/FN rates should expose an opt-out so users can silence the warning without disabling other validation.
 
 ### What is not validated
 
