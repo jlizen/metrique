@@ -55,6 +55,7 @@ Explicitly out of scope for this design. Each has a clear evolution path; none i
 - **Hand-written `Entry` impls opted into descriptors.** A type with `impl Entry for MyType {}` but no `#[metrics]` attribute returns `None` from the erased `descriptor()`. Descriptor-aware sinks skip it. Sketched evolution path: a `DescribeEntry` trait users implement by hand. See "Evolution path: hand-written Entry support" below.
 - **User-defined `Value` types introspectable as non-`Opaque`.** Today, `impl Value for MyType` lowers to `FieldShape::Opaque`. Users who want macro-known shape use `#[metrics(value)]` newtypes. A parallel `DescribeValue` trait is sketched but not shipped.
 - **Distribution-shaped fields (`Histogram<T>`, `SharedHistogram<T>`, user distribution types).** Lower to `FieldShape::Opaque` in this release. Descriptor-aware sinks that select a distribution field via a tag produce a diagnostic and skip the field; EMF and JSON continue to render the distribution normally. Evolution path: add `FieldShape::Distribution(KnownShape)` once `DescribeValue` lands, so aggregation types can self-describe as distribution-shaped without the macro needing to recognise their names syntactically.
+- **Nested containers beyond one level.** `FieldShape::List(&'static FieldShape)` and `FieldShape::Flex { value: &'static FieldShape, .. }` accept `Known(_)` or `Optional(Known(_))` only. Deeper combinations (`Vec<Vec<T>>`, `Vec<Flex<..>>`, `Flex<(String, Vec<T>)>`, `Option<Option<T>>`, etc.) lower to `FieldShape::Opaque`. The descriptor enum is already shaped to represent arbitrary nesting; the restriction lives in the macro's syntactic recognition and can be relaxed additively without changing the descriptor type.
 - **Optional sources on an entry.** An entry either declares `source(T)` or it does not. No "this entry might or might not carry `T`" form.
 - **Multiple sources for the same tag on one entry.** Rejected by the macro.
 - **Heterogeneous values inside a single `Flex` map.** `Flex<(String, T)>` has a fixed `T` per type; no `map<string, Any>` form.
@@ -68,7 +69,7 @@ Explicitly out of scope for this design. Each has a clear evolution path; none i
 - **Source extraction runs on the closed value.** Sources cannot observe mid-request state; they see whatever the closed entry has. This is the right model for a tracing sink (caller-thread capture happens in the field's constructor, flush-thread extraction reads the closed snapshot), but it means "capture something at close time" and "capture something at construction time" look the same on the wire. If a sink ever needs to observe pre-close state, it needs a different primitive.
 - **Flex lowers to `map<string, T>` only.** Current metrique Flex is `Flex<(String, T)>`. The descriptor reflects that exactly. Heterogeneous or multi-level dynamic maps would need a richer shape language; the design deliberately does not pay that cost now.
 - **Descriptor lookup through the erased vtable.** We extend the erased entry trait object with one new method (`descriptor()`), returning `Option<&'static EntryDescriptor>`. That is a one-time surface change to the trait object; after that, `BoxEntry` size is unchanged and descriptor-unaware sinks never call the new method. The addition is a SemVer minor version (not breaking for users of public metrique APIs), but downstream code that directly `impl`s the internal dyn-trait would need to add the method; in practice that impl lives inside metrique.
-- **Descriptor types are `#[non_exhaustive]`.** `EntryDescriptor`, `FieldDescriptor`, `FieldShape`, `KnownShape`, `StringShape`, `SourceDescriptor`, `SourceExtractor`, and `SourceRegistration` all carry `#[non_exhaustive]`. Construction is internal to metrique (macro-only); no public constructor surface is shipped initially. When hand-written `DescribeEntry` arrives, that PR decides how much of the constructor surface to expose (`pub const fn new_*` on the relevant types) without forcing the initial release to lock those choices in.
+- **Descriptor types are `#[non_exhaustive]` with hidden constructors.** `EntryDescriptor`, `FieldDescriptor`, `SourceDescriptor`, `SourceExtractor`, and `SourceRegistration` all carry `#[non_exhaustive]`. Construction goes through `#[doc(hidden)] pub const fn __metrique_private_new(..)` methods on each struct; the ugly name is deliberate. The metrique macro is the only intended caller. When hand-written `DescribeEntry` arrives, that PR adds a cleaner public constructor surface (positional `new` or a builder; decided then) without forcing the initial release to lock the shape in.
 - **Per-source registration cost.** The metrique macro emits one link-time registration static per `source(T)` declaration per descriptor, whether the tag type overrides `SourceTag::register_descriptor` or not. Cost is one `&'static EntryDescriptor` pointer plus `linkme`-compatible plumbing. Alternatives that would make this truly zero (two-trait split + autoref specialization; sink-invoked registration macros) were rejected as too magical or ceremony-heavy for the bytes saved.
 
 ## Why this combination of pieces
@@ -114,15 +115,15 @@ The `SourceTag` trait is a single trait with two responsibilities: declare the t
 ```rust
 pub trait SourceTag: Any + Send + Sync + 'static {
     type Snapshot: Any + Send;
-    fn register_descriptor(_registration: SourceRegistration<\'static>) {}
+    fn register_descriptor(_registration: SourceRegistration) {}
 }
 ```
 
-The macro emits one registration per `source(T)` declaration per descriptor, whether `T` overrides the hook or not. That is a small, bounded binary cost (one `&\'static` pointer per declaration plus `linkme` plumbing metrique uses internally).
+The macro emits one registration per `source(T)` declaration per descriptor, whether `T` overrides the hook or not. That is a small, bounded binary cost (one `&'static` pointer per declaration plus `linkme` plumbing metrique uses internally).
 
 ### Why binary-wide discovery needs any new surface at all
 
-Without some link-time aggregation, sinks cannot detect "I am attached but no matching entries exist in this binary" until they observe live traffic. "The first entry through has no matching tag" does not discriminate misconfiguration from normal startup idle. Binary-wide discovery has to be visible to the sink before the first event is processed, which requires pre-main or link-time machinery that only something generating code in the user\'s crate can emit. The metrique macro is the only such thing in the design.
+Without some link-time aggregation, sinks cannot detect "I am attached but no matching entries exist in this binary" until they observe live traffic. "The first entry through has no matching tag" does not discriminate misconfiguration from normal startup idle. Binary-wide discovery has to be visible to the sink before the first event is processed, which requires pre-main or link-time machinery that only something generating code in the user's crate can emit. The metrique macro is the only such thing in the design.
 
 ### Why one trait with a defaulted hook rather than a two-trait split
 
@@ -134,13 +135,13 @@ Making the macro emit `<T as DiscoverableSourceTag>::register_descriptor(..)` on
 - A sink-owned registration macro invoked at some well-known site. Brings back user ceremony and cross-crate convention contracts.
 - Requiring every `source(T)` to imply `T: DiscoverableSourceTag`, which collapses the split back to one trait.
 
-None of those is worth it for the savings. The per-source registration cost is one `&\'static` pointer per declaration (8 bytes plus the `linkme` slot). For a realistic service with tens of source declarations, that is under a kilobyte of rodata. The single-trait design is simpler to explain and leaves room for additional optional hooks in the future without further trait splits.
+None of those is worth it for the savings. The per-source registration cost is one `&'static` pointer per declaration (8 bytes plus the `linkme` slot). For a realistic service with tens of source declarations, that is under a kilobyte of rodata. The single-trait design is simpler to explain and leaves room for additional optional hooks in the future without further trait splits.
 
 ### Why an associated `Snapshot` type on `SourceTag`
 
 Without it, `desc.source::<C>(..)` has to return `Option<Box<dyn Any + Send>>` and force the sink to downcast manually to whatever snapshot type it knows the tag produces. That moves the type contract out of the trait and into every sink call site. With `type Snapshot`, the call is `Option<C::Snapshot>` and the sink is strongly typed end-to-end. No runtime cost.
 
-### Why `SourceRegistration<\'static>` instead of `&\'static EntryDescriptor` directly
+### Why `SourceRegistration` instead of `&'static EntryDescriptor` directly
 
 Passing a newtype-wrapped struct lets metrique add fields to the registration payload later (source-declared priority, cross-tag linking, future metadata) without breaking every `impl SourceTag`. The struct is `#[non_exhaustive]`; construction is metrique-internal today. When hand-written `DescribeEntry` lands, that PR adds a `pub const fn new(..)` constructor.
 
@@ -149,22 +150,22 @@ Passing a newtype-wrapped struct lets metrique add fields to the registration pa
 A shape we rejected:
 
 ```rust
-pub trait SourceTag: Any + Send + Sync + \'static {
-    const SLICE: &\'static linkme::DistributedSlice<[&\'static EntryDescriptor]>;
+pub trait SourceTag: Any + Send + Sync + 'static {
+    const SLICE: &'static linkme::DistributedSlice<[&'static EntryDescriptor]>;
 }
 ```
 
-This puts `linkme` in metrique\'s public API. Every consumer of the trait inherits a transitive dependency on `linkme`\'s type system. Swapping the backing mechanism (stable Rust distributed slices when they land, an alternative crate, a cfg-gated alternative) would be a breaking change for every sink. The method-on-trait shape keeps the mechanism entirely inside metrique\'s macro expansion and each sink\'s own impl.
+This puts `linkme` in metrique's public API. Every consumer of the trait inherits a transitive dependency on `linkme`'s type system. Swapping the backing mechanism (stable Rust distributed slices when they land, an alternative crate, a cfg-gated alternative) would be a breaking change for every sink. The method-on-trait shape keeps the mechanism entirely inside metrique's macro expansion and each sink's own impl.
 
 ### Why not a convention-named registration macro
 
-A shape we rejected: metrique\'s macro emits, per source, a call to a declarative macro named by the tag\'s crate, e.g. `<TagCrate>::__metrique_register_descriptor!(&DESC, ...)`. The sink crate would have to export a macro with that specific name.
+A shape we rejected: metrique's macro emits, per source, a call to a declarative macro named by the tag's crate, e.g. `<TagCrate>::__metrique_register_descriptor!(&DESC, ...)`. The sink crate would have to export a macro with that specific name.
 
 Rejected because it forces every sink crate to define a macro with a specific name (magical by convention), cannot be enforced by the type system (missing macros produce macro-resolution errors, not trait-bound errors), and duplicates the trait-bound plus trait-method shape for no gain.
 
 ### Why not move registration to the descriptor pointer itself
 
-A shape we rejected: the `EntryDescriptor` carries a list of function pointers (one per declared source) that register it. The metrique macro populates the list from the declared `source(T)` entries, and the descriptor\'s own static initializer runs the registrations.
+A shape we rejected: the `EntryDescriptor` carries a list of function pointers (one per declared source) that register it. The metrique macro populates the list from the declared `source(T)` entries, and the descriptor's own static initializer runs the registrations.
 
 Rejected because it runs registration when the descriptor is first touched, not at program startup. That means sinks cannot detect an empty registry reliably: until an entry actually emits, its descriptor is untouched, its registration has not fired, and the registry looks empty even if code for the struct exists. The link-time path avoids this: registrations happen whether or not the struct is ever instantiated, as long as its code is in the binary.
 
@@ -176,7 +177,7 @@ Startup-time discovery reports "no entries registered for tag T" when a sink ins
 
 - Multi-binary workspace where the tagged entry lives in a different binary from the sink. The binary containing the sink genuinely has no registrations.
 - Target where link-time registration is unavailable (WASM without feature flags, exotic embedded targets). The sink should cfg-gate its `register_descriptor` override so registration is simply unsupported on those targets.
-- Dynamically loaded libraries carrying the entries. Registrations from `dlopen`ed code may not reach the main binary\'s aggregation point.
+- Dynamically loaded libraries carrying the entries. Registrations from `dlopen`ed code may not reach the main binary's aggregation point.
 - Struct defined in a module that `rustc` DCEs entirely (e.g. feature-gated off). No registration is emitted. The warn is technically correct; the struct is not in the binary.
 
 **False positives (registry non-empty, user thinks it should be):**

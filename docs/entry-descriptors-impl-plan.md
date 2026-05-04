@@ -12,7 +12,7 @@ Three tracks with explicit dependencies. Tracks run in parallel where the graph 
 
 Prerequisite for everything else.
 
-- A1. Define `EntryDescriptor`, `FieldDescriptor`, `FieldShape`, `KnownShape`, `StringShape`, `SourceDescriptor`, `SourceExtractor`, `ResolvedFieldTag`, `SourceTag`, and `SourceRegistration` in `metrique-writer-core`. All structs/enums are `#[non_exhaustive]`; construction is metrique-internal initially. Ties to: keeper "The descriptor model", "Sources and extractors".
+- A1. Define `EntryDescriptor`, `FieldDescriptor`, `FieldShape`, `KnownShape`, `StringShape`, `SourceDescriptor`, `SourceExtractor`, `ResolvedFieldTag`, `SourceTag`, and `SourceRegistration` in `metrique-writer-core`. All structs and enums are `#[non_exhaustive]`. Each struct carries a `#[doc(hidden)] pub const fn __metrique_private_new(..)` constructor matching its field order; the macro uses these, the ugly name keeps users away. No public constructor surface ships initially; a cleaner surface arrives with `DescribeEntry`. Ties to: keeper "The descriptor model", "Sources and extractors".
 - A2. Public re-exports from the `metrique` crate.
 
 ### Track M-B: erased entry vtable hook
@@ -27,7 +27,7 @@ Prerequisite for any descriptor-aware sink.
 Depends on M-A and M-B.
 
 - C1. `metrique-macro/src/lib.rs`: accept `default_field_tag(T)`, `default_field_tag(skip(T))`, `field_tag(T)`, `field_tag(skip(T))`, `source(T)`, `no_write`. Parse and validate at expansion time. Ties to: keeper "Field tags", "Sources and extractors", "`no_write`".
-- C2. `metrique-macro/src/structs.rs`: generate the `static EntryDescriptor` constant for macro-derived entries. Field order matches `Entry::write` order (declaration order), fields emit with resolved tags and computed `FieldShape`. Ties to: keeper "The descriptor model".
+- C2. `metrique-macro/src/structs.rs`: generate the `static EntryDescriptor` constant for macro-derived entries. Field order matches `Entry::write` order (declaration order), fields emit with resolved tags and computed `FieldShape`. Recognize `Vec<T>`, `[T]`, and `&[T]` syntactically and lower to `FieldShape::List(inner)` when `T`'s closed shape is `Known(_)` or `Optional(Known(_))` (one layer of optional nesting). Recognize metrique `Flex<(String, T)>` similarly: `Flex { value: Known(_) | Optional(Known(_)) }`. Deeper nesting (nested lists, map-of-list, list-of-map, double-optional) lowers to `FieldShape::Opaque` with a note. Ties to: keeper "The descriptor model", "Opaque trapdoor".
 - C3. Generate a `SourceExtractor` per declared `source(C)` in the entry's descriptor. The extractor is a function that reads the relevant field on the closed entry and produces the tag's `SourceTag::Snapshot`. Construction is macro-internal; the stored function pointer does not have a public constructor in the initial release. Ties to: keeper "Sources and extractors", "Looking sources up via the descriptor".
 - C4. Generate per-source link-time registration. For each `source(T)` declaration, emit a `linkme`-compatible static that invokes `<T as SourceTag>::register_descriptor(SourceRegistration { descriptor: &DESCRIPTOR })` before `main`. Metrique's internal `linkme` usage is scoped to cfg'd-supported targets; on unsupported targets the registration is compiled out. Ties to: keeper "The `SourceTag` trait"; review "Startup-time discovery mechanism".
 - C5. `metrique-macro/src/entry_impl.rs`: `Entry::write` output is consistent with the descriptor's field order; `no_write` fields are omitted from the write path but retained through close.
@@ -53,7 +53,7 @@ pub enum FieldShape {
     Known(KnownShape),
     Optional(&'static FieldShape),
     Flex { key: StringShape, value: &'static FieldShape },
-    List(KnownShape),
+    List(&'static FieldShape),
     Opaque,
 }
 
@@ -74,11 +74,11 @@ pub struct SourceExtractor {
 
 pub trait SourceTag: Any + Send + Sync + 'static {
     type Snapshot: Any + Send;
-    fn register_descriptor(_registration: SourceRegistration<'static>) {}
+    fn register_descriptor(_registration: SourceRegistration) {}
 }
 
 #[non_exhaustive]
-pub struct SourceRegistration<'a> { pub descriptor: &'a EntryDescriptor }
+pub struct SourceRegistration { pub descriptor: &'static EntryDescriptor }
 
 // Descriptor-side typed extraction
 impl EntryDescriptor {

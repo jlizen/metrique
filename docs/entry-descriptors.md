@@ -79,7 +79,7 @@ pub enum FieldShape {
     Known(KnownShape),
     Optional(&'static FieldShape),
     Flex { key: StringShape, value: &'static FieldShape },
-    List(KnownShape),
+    List(&'static FieldShape),
     Opaque,
 }
 
@@ -101,9 +101,13 @@ pub enum StringShape {
 }
 ```
 
-`FieldShape` describes the closed/emitted shape, not the raw Rust field type. `Timer` lowers to `Known(U64)`; `Option<Duration>` to `Optional(Known(U64))`; `Flex<(String, u64)>` to `Flex { key: String, value: Known(U64) }`; `Vec<String>`, `[String]`, and `&[String]` lower to `List(String)`.
+Every descriptor struct (`EntryDescriptor`, `FieldDescriptor`, `SourceDescriptor`, `SourceExtractor`, `SourceRegistration`) is `#[non_exhaustive]` so adding fields is a minor change for external code that matches or destructures. Construction is gated behind hidden `#[doc(hidden)] pub const fn __metrique_private_new(..)` methods on each struct; the names are intentionally ugly to discourage direct use. The metrique macro is the only intended caller. When hand-written `DescribeEntry` ships (see the evolution path in the review), a cleaner public constructor surface is added alongside.
 
-`Known(KnownShape)` covers scalar types metrique understands intrinsically. Macro-generated `#[metrics(value)]` newtypes over a known scalar lower to the wrapped scalar's shape. `List(KnownShape)` covers `Vec<T>`, `[T]`, and `&[T]` whose element type has a known shape. User-written `Value` impls that metrique cannot inspect (a bare `impl Value for MyType`) lower to `FieldShape::Opaque`: the sink knows the field is emitted but cannot predict its wire shape. Distribution-typed fields (`metrique_aggregation::Histogram<T>` and similar) also lower to `Opaque` in this release; see "The Opaque trapdoor" below.
+`FieldShape` describes the closed/emitted shape, not the raw Rust field type. `Timer` lowers to `Known(U64)`; `Option<Duration>` to `Optional(Known(U64))`; `Flex<(String, u64)>` to `Flex { key: String, value: Known(U64) }`; `Flex<(String, Option<Duration>)>` to `Flex { key: String, value: Optional(Known(U64)) }`; `Vec<String>` to `List(Known(String))`; `Vec<Option<String>>` to `List(Optional(Known(String)))`.
+
+Flattening an `Option<SubEntry>` into a parent entry propagates optionality to each flattened field: if `SubEntry { baz: Option<usize> }` is `#[metrics(flatten)]`ed through an `Option<SubEntry>`, the descriptor lists `baz: Optional(Known(U64))`. `Optional` wraps the emit-or-not decision; it is not re-stacked when the inner type is already optional. Genuinely double-optional types (`Option<Option<T>>`) fall through to `FieldShape::Opaque`, in keeping with the one-level nesting restriction below.
+
+`Known(KnownShape)` covers scalar types metrique understands intrinsically. Macro-generated `#[metrics(value)]` newtypes over a known scalar lower to the wrapped scalar's shape. `List(&'static FieldShape)` covers `Vec<T>`, `[T]`, and `&[T]` whose element type lowers to `Known(_)` or `Optional(Known(_))`. `Flex { value: &'static FieldShape, .. }` similarly accepts `Known(_)` or `Optional(Known(_))` as its value shape. Deeper container nesting (`Vec<Vec<T>>`, `Vec<Flex<..>>`, `Flex<(String, Vec<T>)>`, and so on) lowers to `FieldShape::Opaque` in this release; the descriptor enum itself can represent those shapes, but the macro's syntactic recognition is restricted pending `DescribeValue`. User-written `Value` impls that metrique cannot inspect (a bare `impl Value for MyType`) lower to `FieldShape::Opaque`: the sink knows the field is emitted but cannot predict its wire shape. Distribution-typed fields (`metrique_aggregation::Histogram<T>` and similar) also lower to `Opaque` in this release; see "The Opaque trapdoor" below.
 
 Because the descriptor is `#[non_exhaustive]` all the way through, future metrique versions can add `KnownShape` variants without breaking hand-written `DescribeEntry` implementors, and new descriptor-aware sinks can introspect older descriptors without compilation breaks.
 
@@ -184,12 +188,12 @@ pub trait SourceTag: Any + Send + Sync + 'static {
     /// Called once per distinct `&'static EntryDescriptor` declaring `source(Self)`,
     /// before `main`, via link-time registration emitted by the metrique macro.
     /// Default is a no-op. Sinks that want binary-wide discovery override this.
-    fn register_descriptor(_registration: SourceRegistration<'static>) {}
+    fn register_descriptor(_registration: SourceRegistration) {}
 }
 
 #[non_exhaustive]
-pub struct SourceRegistration<'a> {
-    pub descriptor: &'a EntryDescriptor,
+pub struct SourceRegistration {
+    pub descriptor: &'static EntryDescriptor,
 }
 ```
 
@@ -210,7 +214,7 @@ static AUDIT_DESCRIPTORS: Lazy<Mutex<Vec<&'static EntryDescriptor>>>
 impl metrique::SourceTag for audit::RequestContext {
     type Snapshot = audit::RequestCtx;
 
-    fn register_descriptor(reg: metrique::SourceRegistration<'static>) {
+    fn register_descriptor(reg: metrique::SourceRegistration) {
         AUDIT_DESCRIPTORS.lock().unwrap().push(reg.descriptor);
     }
 }
@@ -401,6 +405,7 @@ Short list of things explicitly left out of the initial design that fit the syst
 
 - Hand-written `Entry` impls opting into descriptors via a `DescribeEntry` trait users implement by hand; same mechanism macro-derived entries use internally.
 - `FieldShape::Distribution(KnownShape)` for distribution-typed fields (`Histogram<T>`, `SharedHistogram<T>`, and user types that emit many `Observation`s). Depends on a `DescribeValue` trait so value types can self-describe as distribution-shaped.
+- Nested container recognition beyond one optional layer. `Vec<Vec<T>>`, `Vec<Flex<..>>`, `Flex<(String, Vec<T>)>`, and double-optional all fall through to `Opaque` today; the descriptor enum accepts them, the macro's syntactic recognition just does not. Relaxing is an additive macro change.
 - Optional sources and multiple sources per tag.
 - Heterogeneous values inside `Flex`.
 - A compile-time generated per-sink wire plan, for sinks that want to skip runtime `Entry::write` dispatch entirely.
