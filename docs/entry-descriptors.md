@@ -247,8 +247,8 @@ Under the covers, the descriptor's extractor list is a `&'static [SourceExtracto
 #[non_exhaustive]
 pub struct SourceExtractor {
     pub tag: TypeId,
-    // Internal: extractor function. Typed construction happens in macro expansion.
-    extract: /* macro-internal, not part of the public constructor surface */,
+    // Private: typed extractor function pointer. Construction is macro-internal;
+    // a public constructor ships with the DescribeEntry follow-up.
 }
 ```
 
