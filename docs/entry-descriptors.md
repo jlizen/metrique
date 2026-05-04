@@ -79,6 +79,7 @@ pub enum FieldShape {
     Known(KnownShape),
     Optional(&'static FieldShape),
     Flex { key: StringShape, value: &'static FieldShape },
+    List(KnownShape),
     Opaque,
 }
 
@@ -100,9 +101,9 @@ pub enum StringShape {
 }
 ```
 
-`FieldShape` describes the closed/emitted shape, not the raw Rust field type. `Timer` lowers to `Known(U64)`; `Option<Duration>` to `Optional(Known(U64))`; `Flex<(String, u64)>` to `Flex { key: String, value: Known(U64) }`.
+`FieldShape` describes the closed/emitted shape, not the raw Rust field type. `Timer` lowers to `Known(U64)`; `Option<Duration>` to `Optional(Known(U64))`; `Flex<(String, u64)>` to `Flex { key: String, value: Known(U64) }`; `Vec<String>`, `[String]`, and `&[String]` lower to `List(String)`.
 
-`Known(KnownShape)` covers scalar types metrique understands intrinsically. Macro-generated `#[metrics(value)]` newtypes over a known scalar lower to the wrapped scalar's shape. User-written `Value` impls that metrique cannot inspect (a bare `impl Value for MyType`) lower to `FieldShape::Opaque`: the sink knows the field is emitted but cannot predict its wire shape.
+`Known(KnownShape)` covers scalar types metrique understands intrinsically. Macro-generated `#[metrics(value)]` newtypes over a known scalar lower to the wrapped scalar's shape. `List(KnownShape)` covers `Vec<T>`, `[T]`, and `&[T]` whose element type has a known shape. User-written `Value` impls that metrique cannot inspect (a bare `impl Value for MyType`) lower to `FieldShape::Opaque`: the sink knows the field is emitted but cannot predict its wire shape. Distribution-typed fields (`metrique_aggregation::Histogram<T>` and similar) also lower to `Opaque` in this release; see "The Opaque trapdoor" below.
 
 Because the descriptor is `#[non_exhaustive]` all the way through, future metrique versions can add `KnownShape` variants without breaking hand-written `DescribeEntry` implementors, and new descriptor-aware sinks can introspect older descriptors without compilation breaks.
 
@@ -110,7 +111,9 @@ Because the descriptor is `#[non_exhaustive]` all the way through, future metriq
 
 A field whose closed shape is `FieldShape::Opaque` is fully functional through `Entry::write` (every `Value` impl works; EMF and JSON handle it fine), but descriptor-aware sinks that selected it via a tag have no wire-level shape guarantee for it. Typical sinks skip opaque fields with a diagnostic and continue. This is the price of letting user types implement `Value` without a parallel descriptor hook.
 
-Users who want custom types to flow through descriptor-aware sinks should either use `#[metrics(value)]` (which lowers to a `Known` shape) or wait for the deferred `DescribeValue` extension.
+The most common current Opaque case is distribution-typed fields: `metrique_aggregation::Histogram<T>`, `SharedHistogram<T>`, and user-defined types that emit multiple `Observation`s with the `Distribution` flag. The descriptor has no way to represent "this field emits 0..N observations of an inner scalar type." Such fields are safe to use on EMF/JSON sinks today. Tagging them for a descriptor-aware sink produces a diagnostic and skips the field on that sink; see "Future evolution" for the planned `FieldShape::Distribution` variant.
+
+Users who want custom scalar types to flow through descriptor-aware sinks should either use `#[metrics(value)]` (which lowers to a `Known` shape) or wait for the deferred `DescribeValue` extension.
 
 The descriptor is a `'static` constant. Sinks can cache anything derived from it keyed on the pointer.
 
@@ -397,6 +400,7 @@ Sinks with non-trivial FP/FN rates should expose an opt-out so users can silence
 Short list of things explicitly left out of the initial design that fit the system cleanly:
 
 - Hand-written `Entry` impls opting into descriptors via a `DescribeEntry` trait users implement by hand; same mechanism macro-derived entries use internally.
+- `FieldShape::Distribution(KnownShape)` for distribution-typed fields (`Histogram<T>`, `SharedHistogram<T>`, and user types that emit many `Observation`s). Depends on a `DescribeValue` trait so value types can self-describe as distribution-shaped.
 - Optional sources and multiple sources per tag.
 - Heterogeneous values inside `Flex`.
 - A compile-time generated per-sink wire plan, for sinks that want to skip runtime `Entry::write` dispatch entirely.

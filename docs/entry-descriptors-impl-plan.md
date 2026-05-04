@@ -53,6 +53,7 @@ pub enum FieldShape {
     Known(KnownShape),
     Optional(&'static FieldShape),
     Flex { key: StringShape, value: &'static FieldShape },
+    List(KnownShape),
     Opaque,
 }
 

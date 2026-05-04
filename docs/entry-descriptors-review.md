@@ -54,6 +54,7 @@ Explicitly out of scope for this design. Each has a clear evolution path; none i
 
 - **Hand-written `Entry` impls opted into descriptors.** A type with `impl Entry for MyType {}` but no `#[metrics]` attribute returns `None` from the erased `descriptor()`. Descriptor-aware sinks skip it. Sketched evolution path: a `DescribeEntry` trait users implement by hand. See "Evolution path: hand-written Entry support" below.
 - **User-defined `Value` types introspectable as non-`Opaque`.** Today, `impl Value for MyType` lowers to `FieldShape::Opaque`. Users who want macro-known shape use `#[metrics(value)]` newtypes. A parallel `DescribeValue` trait is sketched but not shipped.
+- **Distribution-shaped fields (`Histogram<T>`, `SharedHistogram<T>`, user distribution types).** Lower to `FieldShape::Opaque` in this release. Descriptor-aware sinks that select a distribution field via a tag produce a diagnostic and skip the field; EMF and JSON continue to render the distribution normally. Evolution path: add `FieldShape::Distribution(KnownShape)` once `DescribeValue` lands, so aggregation types can self-describe as distribution-shaped without the macro needing to recognise their names syntactically.
 - **Optional sources on an entry.** An entry either declares `source(T)` or it does not. No "this entry might or might not carry `T`" form.
 - **Multiple sources for the same tag on one entry.** Rejected by the macro.
 - **Heterogeneous values inside a single `Flex` map.** `Flex<(String, T)>` has a fixed `T` per type; no `map<string, Any>` form.
