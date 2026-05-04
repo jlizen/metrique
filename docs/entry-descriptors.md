@@ -1,5 +1,7 @@
 # Entry descriptors, sources, and field tags
 
+> **Status: design, not yet implemented.**
+
 A system on top of metrique's existing `Entry` / `Value` / `CloseValue` traits that lets sinks introspect entry structure and lift structural context out of closed entries.
 
 Three pieces:
