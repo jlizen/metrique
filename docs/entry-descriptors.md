@@ -18,7 +18,7 @@ Plus a narrow `no_write` attribute for fields that must participate in close but
 - First-class units in the descriptor, surfaced however each sink prefers.
 - All of the above after `BoxEntry` erasure.
 
-Sinks that do not care can safely ignore it (besides storing an extra pointer).
+Sinks that do not care can safely ignore the descriptor surface; the runtime cost to them is zero. The cost footprint for sinks that do opt in, or for any user who declares `#[metrics(source(T))]`, is one `&'static EntryDescriptor` pointer per source declaration in the binary (see "The `SourceTag` trait" below for the mechanics). The cost is bounded and documented so it does not come as a surprise.
 
 ## At a glance
 
@@ -236,6 +236,10 @@ impl EntryDescriptor {
     ) -> Option<C::Snapshot>;
 }
 ```
+
+`source::<C>` returns `None` in two cases: the entry does not declare `source(C)` (the descriptor has no extractor with `tag == TypeId::of::<C>()`), or the passed `entry` is not the `inner_any()` of an instance the extractor was generated for (the typed cast inside the extractor fails). Both represent user error (or intentional omission); the caller gets the same outcome either way.
+
+Two distinct source tags may share the same `Snapshot` type. Extractors are keyed on the tag's `TypeId`, not on the snapshot type, so `desc.source::<Alpha>(..)` and `desc.source::<Beta>(..)` dispatch independently even if `Alpha::Snapshot == Beta::Snapshot`.
 
 Under the covers, the descriptor's extractor list is a `&'static [SourceExtractor]`, where each `SourceExtractor` carries the tag's `TypeId` and a typed function pointer. Construction is entirely macro-internal.
 

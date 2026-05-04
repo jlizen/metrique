@@ -100,7 +100,7 @@ pub trait DescribeEntry: Entry {
 
 A `DescribeEntry` impl would populate the same `EntryDescriptor` the macro produces. The metrique macro becomes one implementor of a public surface, not the only implementor. The follow-up PR would need to:
 
-- Add `pub const fn new_*` constructors on `EntryDescriptor`, `FieldDescriptor`, `FieldShape`, `KnownShape`, `StringShape`, `SourceDescriptor`, and `SourceRegistration` so users can build them in `const` context.
+- Promote the hidden `__metrique_private_new` constructors on `EntryDescriptor`, `FieldDescriptor`, `FieldShape`, `KnownShape`, `StringShape`, `SourceDescriptor`, and `SourceRegistration` to a user-facing `pub const fn new(..)` surface (or a builder), so hand-written users can build descriptors in `const` context without relying on names we reserve for macro use.
 - Define how users populate `source_extractors` by hand (typed function pointer with a `TypeId` key is the leading candidate).
 - Decide whether `ResolvedFieldTag` gets public `const` constructors or a `tags![..]` macro.
 
