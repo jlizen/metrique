@@ -12,7 +12,7 @@ Three tracks with explicit dependencies. Tracks run in parallel where the graph 
 
 Prerequisite for everything else.
 
-- A1. Define `EntryDescriptor`, `FieldDescriptor`, `FieldShape`, `KnownShape`, `StringShape`, `SourceDescriptor`, `SourceExtractor`, `ResolvedFieldTag`, `SourceTag`, and `SourceRegistration` in `metrique-writer-core`. All structs/enums are `#[non_exhaustive]`; construction is metrique-internal in this round. Ties to: keeper "The descriptor model", "Sources and extractors".
+- A1. Define `EntryDescriptor`, `FieldDescriptor`, `FieldShape`, `KnownShape`, `StringShape`, `SourceDescriptor`, `SourceExtractor`, `ResolvedFieldTag`, `SourceTag`, and `SourceRegistration` in `metrique-writer-core`. All structs/enums are `#[non_exhaustive]`; construction is metrique-internal initially. Ties to: keeper "The descriptor model", "Sources and extractors".
 - A2. Public re-exports from the `metrique` crate.
 
 ### Track M-B: erased entry vtable hook
@@ -28,7 +28,7 @@ Depends on M-A and M-B.
 
 - C1. `metrique-macro/src/lib.rs`: accept `default_field_tag(T)`, `default_field_tag(skip(T))`, `field_tag(T)`, `field_tag(skip(T))`, `source(T)`, `no_write`. Parse and validate at expansion time. Ties to: keeper "Field tags", "Sources and extractors", "`no_write`".
 - C2. `metrique-macro/src/structs.rs`: generate the `static EntryDescriptor` constant for macro-derived entries. Field order matches `Entry::write` order (declaration order), fields emit with resolved tags and computed `FieldShape`. Ties to: keeper "The descriptor model".
-- C3. Generate a `SourceExtractor` per declared `source(C)` in the entry's descriptor. The extractor is a function that reads the relevant field on the closed entry and produces the tag's `SourceTag::Snapshot`. Construction is macro-internal; the stored function pointer does not have a public constructor in this round. Ties to: keeper "Sources and extractors", "Looking sources up via the descriptor".
+- C3. Generate a `SourceExtractor` per declared `source(C)` in the entry's descriptor. The extractor is a function that reads the relevant field on the closed entry and produces the tag's `SourceTag::Snapshot`. Construction is macro-internal; the stored function pointer does not have a public constructor in the initial release. Ties to: keeper "Sources and extractors", "Looking sources up via the descriptor".
 - C4. Generate per-source link-time registration. For each `source(T)` declaration, emit a `linkme`-compatible static that invokes `<T as SourceTag>::register_descriptor(SourceRegistration { descriptor: &DESCRIPTOR })` before `main`. Metrique's internal `linkme` usage is scoped to cfg'd-supported targets; on unsupported targets the registration is compiled out. Ties to: keeper "The `SourceTag` trait"; review "Startup-time discovery mechanism".
 - C5. `metrique-macro/src/entry_impl.rs`: `Entry::write` output is consistent with the descriptor's field order; `no_write` fields are omitted from the write path but retained through close.
 - C6. Macro-level diagnostics for intrinsic validation: duplicate `source(T)`, conflicting `field_tag(T)` vs `field_tag(skip(T))`, conflicting `default_field_tag` declarations, `source(T)` where `T: !SourceTag`, `no_write + flatten` on the same field. Ties to: keeper "Validation → Compile-time".
@@ -69,7 +69,7 @@ pub struct SourceDescriptor { pub tag: TypeId /* ... */ }
 #[non_exhaustive]
 pub struct SourceExtractor {
     pub tag: TypeId,
-    // Internal extractor function; no public constructor in this round.
+    // Internal extractor function; no public constructor in the initial release.
 }
 
 pub trait SourceTag: Any + Send + Sync + 'static {
