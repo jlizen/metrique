@@ -18,7 +18,7 @@ Plus a narrow `no_write` attribute for fields that must participate in close but
 - First-class units in the descriptor, surfaced however each sink prefers.
 - All of the above after `BoxEntry` erasure.
 
-Sinks that do not care pay nothing.
+Sinks that do not care can safely ignore it (besides storing an extra pointer).
 
 ## At a glance
 
@@ -154,88 +154,92 @@ Full resolution rules including worked inheritance and flatten cases are documen
 
 ## Sources and extractors
 
-Declaration is user-facing:
+Declaration is user-facing (though library structs can tag their own types, so users don't have to):
 
 ```rust
 #[metrics(source(audit::RequestContext))]
 struct RequestAudit { /* ... */ }
 ```
 
-The generated implementation is an extractor against the closed value:
+The macro generates an internal extractor that reads a typed `Snapshot` out of the closed value and registers it in the entry's descriptor. Sinks do not implement the extractor themselves; they read it via the descriptor at the event path:
 
 ```rust
-pub trait Extractable<C> {
-    type Snapshot;
-    fn snapshot(&self) -> Self::Snapshot;
-}
-
-impl Extractable<audit::RequestContext> for ClosedRequestAudit {
-    type Snapshot = audit::RequestCtx;
-    fn snapshot(&self) -> audit::RequestCtx { /* … */ }
-}
+let snapshot: Option<C::Snapshot> = desc.source::<C>(entry.inner_any());
 ```
 
-Sinks look sources up by tag through the descriptor and call the extractor on the closed entry's `inner_any`.
-
-An ad-hoc field form is supported as an escape hatch for types that do not self-describe as a source:
-
-```rust
-#[metrics(source(audit::RequestContext), no_write)]
-ctx: MyAdHocContext,
-```
-
-Prefer self-describing source types where possible.
+`desc.source::<C>()` is sugar for "look up the registered extractor for tag `C`, invoke it on this closed entry's `Any`, return the typed snapshot the tag's `SourceTag::Snapshot` type declares." Sinks do not downcast manually.
 
 ### The `SourceTag` trait
 
-Every type used as a source tag (the `C` in `source(C)`) must implement `SourceTag`:
+Every type used as a source tag (the `C` in `source(C)`) must implement `SourceTag`. The trait declares the typed snapshot the tag produces and carries an optional hook for sinks that want binary-wide discovery.
 
 ```rust
-pub trait SourceTag: Any + Send + Sync + 'static {}
-```
+pub trait SourceTag: Any + Send + Sync + 'static {
+    /// The typed snapshot returned by `desc.source::<Self>(..)`.
+    type Snapshot: Any + Send;
 
-It is a pure marker. Implementing it is a one-line impl with no boilerplate:
-
-```rust
-impl metrique::SourceTag for audit::RequestContext {}
-```
-
-The marker catches typos at the macro boundary (`source(T)` where `T` is not a `SourceTag` is a trait-bound error) and carries no runtime cost. Sinks that want nothing more stop here.
-
-### Opting into binary-wide discovery
-
-Sinks that want to learn "every struct in this binary declaring `source(Self)`" (to validate early, build a registry, warn on empty, etc.) additionally implement `DiscoverableSourceTag`:
-
-```rust
-pub trait DiscoverableSourceTag: SourceTag {
-    fn register_descriptor(registration: SourceRegistration<'static>);
+    /// Called once per distinct `&'static EntryDescriptor` declaring `source(Self)`,
+    /// before `main`, via link-time registration emitted by the metrique macro.
+    /// Default is a no-op. Sinks that want binary-wide discovery override this.
+    fn register_descriptor(_registration: SourceRegistration<'static>) {}
 }
 
 #[non_exhaustive]
 pub struct SourceRegistration<'a> {
     pub descriptor: &'a EntryDescriptor,
-    // room for future fields
 }
 ```
 
-`register_descriptor` is called once per distinct `&'static EntryDescriptor` that declares `source(Self)`, before `main`, via link-time registration emitted by the metrique macro. How that registration is plumbed under the hood (`linkme`, `ctor`, a future stable mechanism) is an implementation detail.
+A sink that only needs typed extraction at the event path implements the trait with just the associated type:
 
-A sink that wants a binary-wide registry implements both traits:
+```rust
+impl metrique::SourceTag for audit::RequestContext {
+    type Snapshot = audit::RequestCtx;
+}
+```
+
+A sink that also wants binary-wide discovery populates its own registry in the hook:
 
 ```rust
 static AUDIT_DESCRIPTORS: Lazy<Mutex<Vec<&'static EntryDescriptor>>>
     = Lazy::new(|| Mutex::new(Vec::new()));
 
-impl metrique::SourceTag for audit::RequestContext {}
+impl metrique::SourceTag for audit::RequestContext {
+    type Snapshot = audit::RequestCtx;
 
-impl metrique::DiscoverableSourceTag for audit::RequestContext {
     fn register_descriptor(reg: metrique::SourceRegistration<'static>) {
         AUDIT_DESCRIPTORS.lock().unwrap().push(reg.descriptor);
     }
 }
 ```
 
-Sinks that implement only `SourceTag` (not `DiscoverableSourceTag`) emit no link-time registrations. Their binary has no per-source registration statics and no `linkme` machinery; they pay literally nothing. Sinks that opt into discovery pay one `&'static` pointer per `source(Self)` declaration per descriptor.
+The metrique macro emits one link-time registration per `source(T)` declaration regardless of whether `T` overrides `register_descriptor`. That costs one `&'static EntryDescriptor` pointer per declaration plus a `linkme`-compatible static. Sinks that do not override the hook inherit the default no-op; the registration slot still exists in the binary. The cost is bounded and small (tens to hundreds of bytes for a typical service); the simplicity of a single-trait API is worth the storage.
+
+How registration is plumbed under the hood (`linkme`, `ctor`, a future stable mechanism) is an implementation detail behind `register_descriptor`.
+
+### Looking sources up via the descriptor
+
+Each `source(T)` declaration produces one entry in the descriptor's `source_extractors` array. Sinks call:
+
+```rust
+impl EntryDescriptor {
+    pub fn source<C: SourceTag>(
+        &self,
+        entry: &(dyn Any + Send + 'static),
+    ) -> Option<C::Snapshot>;
+}
+```
+
+Under the covers, the descriptor's extractor list is a `&'static [SourceExtractor]`, where each `SourceExtractor` carries the tag's `TypeId` and a typed function pointer. Construction is entirely macro-internal.
+
+```rust
+#[non_exhaustive]
+pub struct SourceExtractor {
+    pub tag: TypeId,
+    // Internal: extractor function. Typed construction happens in macro expansion.
+    extract: /* macro-internal, not part of the public constructor surface */,
+}
+```
 
 ## `no_write`
 
@@ -252,7 +256,7 @@ Sources are ordinary metrique fields and structs. They close, they live on the c
 │ For each macro-derived entry:                               │
 │   impl Entry for ClosedX (as today)                         │
 │   static EntryDescriptor                                    │
-│   impl Extractable<C> for ClosedX (per declared source)          │
+│   SourceExtractor stored in descriptor per source            │
 │   descriptor() hook on the erased entry vtable              │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -371,9 +375,9 @@ The checks run once per descriptor (caching on the `&'static` pointer). The sink
 
 ### Startup-time (binary-wide, opt-in per sink)
 
-Sinks that want to catch "the sink is attached but no compatible entry types exist in this binary" implement `DiscoverableSourceTag` and override `register_descriptor`. When a sink provides that impl, every macro-derived descriptor declaring `source(Self)` is registered in whatever store the sink chooses, before `main`. At sink construction, the sink inspects its store and emits a warning (or other signal) if nothing is registered. Sinks that implement only the `SourceTag` marker pay nothing.
+Sinks that want to catch "the sink is attached but no compatible entry types exist in this binary" override `SourceTag::register_descriptor`. The metrique macro emits link-time registration per `source(Self)` declaration unconditionally; a sink that overrides the hook gets each descriptor delivered before `main`. At sink construction, the sink inspects whatever store it populated in the hook and emits a warning (or other signal) if nothing is registered. Sinks that leave the default no-op still pay a fixed per-declaration storage cost in the binary (see the `SourceTag` section) but no runtime work.
 
-This pattern is opt-in for sinks and entirely transparent to end users. Sinks that do not care leave the hook defaulted; metrique emits registration calls regardless, but the default implementation is a no-op and the compiler inlines it away.
+This pattern is opt-in for sinks and entirely transparent to end users. Sinks that do not care leave the hook defaulted; the registration slot still exists in the binary but the default implementation is a no-op the compiler inlines to nothing.
 
 Startup-time discovery has known false-positive and false-negative modes that each sink must document for its users:
 
