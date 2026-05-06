@@ -62,7 +62,7 @@ pub struct FieldDescriptor { /* private fields */ }
 impl FieldDescriptor {
     pub fn name(&self) -> &str;
     pub fn tags(&self) -> &[ResolvedFieldTag];
-    pub fn shape(&self) -> FieldShape;
+    pub fn shape(&self) -> FieldShape<'_>;
     pub fn unit(&self) -> Option<Unit>;
 }
 
@@ -72,17 +72,17 @@ impl TimestampDescriptor {
 }
 
 #[non_exhaustive]
-pub enum FieldShape {
+pub enum FieldShape<'a> {
     Known(KnownShape),
-    Optional(ShapeRef<'_>),
-    Flex { key: StringShape, value: ShapeRef<'_> },
-    List(ShapeRef<'_>),
+    Optional(ShapeRef<'a>),
+    Flex { key: StringShape, value: ShapeRef<'a> },
+    List(ShapeRef<'a>),
     Opaque,
 }
 
 pub struct ShapeRef<'a> { /* private */ }
 impl<'a> ShapeRef<'a> {
-    pub fn as_ref(&self) -> &FieldShape;
+    pub fn as_ref(&self) -> &FieldShape<'a>;
 }
 
 #[non_exhaustive]

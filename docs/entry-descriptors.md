@@ -90,7 +90,7 @@ impl FieldDescriptor {
     pub fn name(&self) -> &str;
 
     pub fn tags(&self) -> &[ResolvedFieldTag];
-    pub fn shape(&self) -> FieldShape;
+    pub fn shape(&self) -> FieldShape<'_>;
     pub fn unit(&self) -> Option<Unit>;
 }
 
@@ -102,11 +102,11 @@ impl TimestampDescriptor {
 }
 
 #[non_exhaustive]
-pub enum FieldShape {
+pub enum FieldShape<'a> {
     Known(KnownShape),
-    Optional(ShapeRef),
-    Flex { key: StringShape, value: ShapeRef },
-    List(ShapeRef),
+    Optional(ShapeRef<'a>),
+    Flex { key: StringShape, value: ShapeRef<'a> },
+    List(ShapeRef<'a>),
     Opaque,
 }
 
@@ -133,7 +133,7 @@ pub enum StringShape {
 pub struct ShapeRef<'a> { /* opaque */ }
 
 impl<'a> ShapeRef<'a> {
-    pub fn as_ref(&self) -> &FieldShape;
+    pub fn as_ref(&self) -> &FieldShape<'a>;
 }
 
 pub struct ResolvedFieldTag { /* opaque */ }
@@ -226,9 +226,17 @@ Sinks key their per-entry-type caches on `DescriptorId`. The initial release bac
 
 Extending `Entry` rather than introducing a separate trait keeps descriptor lookup on the path users already know, keeps `BoxEntry` forwarding natural, and avoids growing the object-safety surface.
 
+### Entry enums
+
+`#[metrics]` on an enum produces an entry whose variants share a single flat descriptor. The descriptor includes the variant-tag field (configured via `#[metrics(tag(name = "..."))]`) plus the union of all variant fields. Fields that appear only in some variants are represented as `FieldShape::Optional(..)` in the descriptor; the union-of-fields approach is what lets the entry have one schema for all variants.
+
+Per-variant descriptors (where each variant emits its own narrower schema) are a future evolution that requires `DescriptorRef` to back with `Arc<EntryDescriptor>` rather than `&'static`; the opaque handle leaves that open.
+
 ### `Entry::write` order contract
 
-The metrique macro emits `Entry::write`'s `value(..)` callbacks in the same order as the fields in `descriptor().fields()`. Consumers walking `Entry::write` may index into the descriptor positionally.
+The metrique macro emits exactly one `EntryWriter::value(name, ..)` callback per `FieldDescriptor`, in the same order as the fields in `descriptor().fields()`. Consumers walking `Entry::write` may index into the descriptor positionally.
+
+Multi-element fields (`Vec<T>`, `Flex<(String, T)>`, and similar) still produce exactly one `value()` callback per `FieldDescriptor`. The multiplicity is handled inside the `Value` impl, which the adapter's `ValueWriter` observes through `ValueWriter::values()` (for `Vec<T>` / `[T]`) or similar dispatch methods. Descriptor-aware sinks that want typed encoding for these fields override the corresponding `ValueWriter` method; the default implementations collapse multi-element data into a single scalar (comma-joined string for `values()`), which is a valid but lossy fallback.
 
 The contract is guaranteed by construction for macro-derived entries (the macro emits both from the same iteration). A debug-mode check inside metrique's test harness validates correspondence; CI tests assert it on every release. Hand-written entries that ship a descriptor (a deferred feature) must uphold the same correspondence.
 
