@@ -18,7 +18,7 @@ Scoped down and polished in response to PR reviewer feedback.
 ### API shape changes driven by the PR reviewer
 
 - **Descriptor accessors return `&self`-tied borrows** (not `&'static`). Metrique internally stores `&'static` in the initial release but the accessor surface does not expose that lifetime. The reviewer pointed out that `#[non_exhaustive]` alone does not give forward-compat for lifetime changes; narrowing the accessor lifetime up front provides the equivalent guarantee without introducing accessor bloat.
-- **Nested `FieldShape` references wrap in `ShapeRef<'_>`** — opaque, `&self`-tied. Lets metrique change internal storage of nested shapes (e.g. to an `Arc`-backed representation for future enum-per-variant descriptors) without breaking consumers.
+- **Nested `FieldShape` references wrap in `ShapeRef<'_>`**: opaque, `&self`-tied. Lets metrique change internal storage of nested shapes (e.g. to an `Arc`-backed representation for future enum-per-variant descriptors) without breaking consumers.
 - **`DescriptorRef<'_>` is opaque**, backed by `&'static EntryDescriptor` today. Future `Arc`-backed variants (needed for enum-per-variant or hand-written descriptors) slot in without API churn.
 - **`DescriptorId` is opaque, stable in-process only.** Documented. Cross-process stability left for a future content-hash accessor.
 - **`Entry::descriptor()` is a defaulted method on the existing `Entry` trait** (not a separate `ErasedEntry`). The reviewer explicitly asked for this.

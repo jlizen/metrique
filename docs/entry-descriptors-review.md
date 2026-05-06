@@ -295,7 +295,7 @@ Runtime discovery is not precluded by the descriptor design: a sink that wants t
 
 ### G: Accessor methods in place of enum variants on FieldShape
 
-Proposed shape (from the PR reviewer): "provide accessor methods and suggest that consumers use those, e.g. `.as_str()`" — apply to `FieldShape` / `KnownShape` so metrique can add variants without consumers being stuck matching on old variant sets.
+Proposed shape (from the PR reviewer): "provide accessor methods and suggest that consumers use those, e.g. `.as_str()`", applied to `FieldShape` / `KnownShape` so metrique can add variants without consumers being stuck matching on old variant sets.
 
 Taken in spirit but implemented differently. The reviewer's underlying concern was lifetime and representation forward-compat. We address that by narrowing all accessor lifetimes to `&self` up front and wrapping nested references in `ShapeRef`. Enum variants stay public, because the dominant consumer (wire encoders) needs exhaustive matching; adding accessors in parallel would be API bloat without solving the real case.
 
