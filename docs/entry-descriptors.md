@@ -70,7 +70,11 @@ pub struct EntryDescriptor { /* opaque */ }
 impl EntryDescriptor {
     /// Canonical name of this entry type. In the initial release this is the
     /// raw Rust struct name; a future `#[metrics(entry_name = "...")]` attribute
-    /// will let users override.
+    /// will let users override. Consumers that persist the name (e.g., for
+    /// cross-session correlation or schema registration) should be aware that
+    /// the name will change if the user renames the Rust struct; until the
+    /// `entry_name` attribute ships, there is no mechanism for decoupling the
+    /// on-wire entry identity from the Rust type name.
     pub fn name(&self) -> &str;
 
     /// Ordered fields the entry emits via `Entry::write`. Does not include
@@ -410,7 +414,10 @@ Short list of things explicitly left out of the initial design that fit the syst
 
 Not shipped in the initial release. Captured here so future consumers (OTEL, a future richer dial9 integration, privacy-tier sinks) can evaluate whether it fits their needs.
 
-Motivation: some sinks want to lift structural data out of a closed entry before encoding fields. Examples: a tracing sink wants a monotonic timestamp + task id to put in the event header; an OTEL sink wants a trace id + span id. Today, a sink either reads those values by field-name convention or identifies them via a sink-specific field tag.
+Motivation: a typed source-extraction system would give sinks two capabilities that are not available in the initial design.
+
+1. **Lifting structured envelope metadata out of the closed entry before encoding fields.** Examples: a tracing sink wants a monotonic timestamp + task id to put in the event header; an OTEL sink wants a trace id + span id; a privacy sink wants a tenant id. Today, a sink either reads those values by field-name convention or identifies them via a sink-specific field tag and walks the descriptor on first use. A typed `desc.source::<C>(entry)` API gives direct, type-checked access.
+2. **Earlier validation.** The source system's optional `register_descriptor` hook lets sinks discover, at program-startup time, every descriptor in the binary declaring a given source tag. Sinks can then validate (once, at startup) that every entry carrying their source tag is shaped correctly, rather than validating lazily on first use as the initial design requires. For sinks that care about "every wrong declaration fails loudly at startup," this is the difference between a test run surfacing a problem and the first production request surfacing it.
 
 A typed source-extraction system would add:
 
