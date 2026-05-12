@@ -79,9 +79,7 @@ async fn aggregated_pipeline_emits_counters_and_histograms() {
                         for dp in sum.data_points() {
                             let mut attrs: Vec<(String, String)> = dp
                                 .attributes()
-                                .map(|kv| {
-                                    (kv.key.to_string(), kv.value.as_str().into_owned())
-                                })
+                                .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
                                 .collect();
                             attrs.sort();
                             let op = attrs
@@ -97,9 +95,7 @@ async fn aggregated_pipeline_emits_counters_and_histograms() {
                         for dp in hist.data_points() {
                             let mut attrs: Vec<(String, String)> = dp
                                 .attributes()
-                                .map(|kv| {
-                                    (kv.key.to_string(), kv.value.as_str().into_owned())
-                                })
+                                .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
                                 .collect();
                             attrs.sort();
                             histogram_attrs.push(attrs);
@@ -114,10 +110,7 @@ async fn aggregated_pipeline_emits_counters_and_histograms() {
     counter_values_by_op.sort();
     assert_eq!(
         counter_values_by_op,
-        vec![
-            ("GET".to_string(), 3),
-            ("POST".to_string(), 1),
-        ],
+        vec![("GET".to_string(), 3), ("POST".to_string(), 1),],
         "Sum strategy should produce one counter point per Operation key"
     );
 
@@ -129,11 +122,9 @@ async fn aggregated_pipeline_emits_counters_and_histograms() {
     );
 
     assert!(
-        histogram_attrs
+        histogram_attrs.iter().any(|attrs| attrs
             .iter()
-            .any(|attrs| attrs
-                .iter()
-                .any(|(k, v)| k == "operation" && (v == "GET" || v == "POST"))),
+            .any(|(k, v)| k == "operation" && (v == "GET" || v == "POST"))),
         "expected Operation attribute on histogram points, got {histogram_attrs:?}"
     );
     assert_eq!(

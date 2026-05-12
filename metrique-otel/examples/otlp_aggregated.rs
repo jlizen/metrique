@@ -23,11 +23,7 @@ use std::time::Duration;
 use metrique::unit::Millisecond;
 use metrique::unit_of_work::metrics;
 use metrique_aggregation::{
-    aggregate,
-    aggregator::KeyedAggregator,
-    histogram::Histogram,
-    sink::WorkerSink,
-    value::Sum,
+    aggregate, aggregator::KeyedAggregator, histogram::Histogram, sink::WorkerSink, value::Sum,
 };
 use metrique_otel::OtelSink;
 

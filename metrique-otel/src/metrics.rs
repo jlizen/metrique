@@ -84,10 +84,7 @@ impl InstrumentCache {
                         .build(),
                 ),
                 InstrumentKind::Gauge => CachedInstrument::Gauge(
-                    meter
-                        .f64_gauge(name.to_owned())
-                        .with_unit(unit_str)
-                        .build(),
+                    meter.f64_gauge(name.to_owned()).with_unit(unit_str).build(),
                 ),
             }
         });
