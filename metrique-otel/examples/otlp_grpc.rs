@@ -6,9 +6,7 @@
 //! metric in that entry. Suitable for low/medium volume.
 //!
 //! The recommended high-throughput topology is `KeyedAggregator -> WorkerSink
-//! -> OtelSink` (see `metrique-aggregation`); that path becomes the primary
-//! example once `ForceFlag<T>: AddAssign where T: AddAssign` and the
-//! `aggregated_otlp_default()` helper land.
+//! -> OtelSink` (see `metrique-aggregation` and `otlp_aggregated.rs`).
 //!
 //! ## Running this example
 //!
@@ -39,7 +37,8 @@ use metrique::unit::Millisecond;
 use metrique::unit_of_work::metrics;
 use metrique::writer::AttachGlobalEntrySink;
 use metrique::writer::GlobalEntrySink;
-use metrique_otel::{Counter, Gauge, Histogram, OtelSink, UpDownCounter};
+use metrique_otel::OtelSink;
+use metrique_otel::tags::{Counter, Gauge, Histogram, UpDownCounter};
 
 #[metrics(rename_all = "PascalCase")]
 struct RequestMetrics {
@@ -48,13 +47,17 @@ struct RequestMetrics {
 
     operation: String,
 
-    request_count: Counter<u64>,
-    queue_delta: UpDownCounter<f64>,
+    #[metrics(field_tag(Counter))]
+    request_count: u64,
 
-    #[metrics(unit = Millisecond)]
-    latency: Histogram<Duration>,
+    #[metrics(field_tag(UpDownCounter))]
+    queue_delta: f64,
 
-    cpu_usage: Gauge<f64>,
+    #[metrics(unit = Millisecond, field_tag(Histogram))]
+    latency: Duration,
+
+    #[metrics(field_tag(Gauge))]
+    cpu_usage: f64,
 }
 
 impl RequestMetrics {
@@ -62,10 +65,10 @@ impl RequestMetrics {
         Self {
             timestamp: SystemTime::now(),
             operation,
-            request_count: Counter::from(0),
-            queue_delta: UpDownCounter::from(0.0),
-            latency: Histogram::from(Duration::default()),
-            cpu_usage: Gauge::from(0.0),
+            request_count: 0,
+            queue_delta: 0.0,
+            latency: Duration::default(),
+            cpu_usage: 0.0,
         }
         .append_on_drop(ServiceMetrics::sink())
     }
@@ -92,9 +95,9 @@ async fn handle_request(operation: &str) {
     let start = std::time::Instant::now();
     let mut metrics = RequestMetrics::init(operation.to_owned());
 
-    *metrics.request_count += 1;
-    *metrics.queue_delta += 1.0;
-    *metrics.cpu_usage = 0.42;
+    metrics.request_count += 1;
+    metrics.queue_delta += 1.0;
+    metrics.cpu_usage = 0.42;
 
-    *metrics.latency = start.elapsed();
+    metrics.latency = start.elapsed();
 }

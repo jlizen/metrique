@@ -26,6 +26,7 @@ use metrique_aggregation::{
     aggregate, aggregator::KeyedAggregator, histogram::Histogram, sink::WorkerSink, value::Sum,
 };
 use metrique_otel::OtelSink;
+use metrique_otel::tags::Counter;
 
 #[aggregate]
 #[metrics(rename_all = "PascalCase")]
@@ -35,13 +36,16 @@ struct RequestMetrics {
     operation: String,
 
     /// Summed across all requests sharing the same `operation`; flushed as a
-    /// single `add()` on an OTEL counter.
+    /// single `add()` on an OTEL counter. The `field_tag(Counter)` is what
+    /// the sink reads off the descriptor to pick the OTel instrument kind.
     #[aggregate(strategy = Sum)]
+    #[metrics(field_tag(Counter))]
     request_count: u64,
 
     /// Each `add_value` is preserved exactly; on flush, the merged
     /// distribution emits multi-observation data the `OtelSink` recognizes
-    /// (via the `Distribution` flag) and records on an OTEL histogram.
+    /// (via the `Distribution` flag emitted by `metrique-aggregation`) and
+    /// records on an OTel histogram.
     #[aggregate(strategy = Histogram<Duration>)]
     #[metrics(unit = Millisecond)]
     latency: Duration,

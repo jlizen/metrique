@@ -3,24 +3,29 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-mod flags;
 mod metrics;
+pub mod tags;
 mod translator;
 
-pub use flags::{
-    Counter, CounterCtor, Gauge, GaugeCtor, Histogram, HistogramCtor, InstrumentKind,
-    UpDownCounter, UpDownCounterCtor,
-};
+pub use metrics::InstrumentKind;
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hasher,
+    sync::{Arc, RwLock},
+};
 
 use metrique_writer_core::{
     Entry,
+    descriptor::DescriptorId,
     sink::{EntrySink, FlushWait},
 };
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
 
-use crate::{metrics::InstrumentCache, translator::OtelEntryWriter};
+use crate::{
+    metrics::InstrumentCache,
+    translator::{EntryPlan, OtelEntryWriter},
+};
 
 #[derive(Clone)]
 pub struct OtelSink {
@@ -30,6 +35,14 @@ pub struct OtelSink {
 struct OtelSinkInner {
     meter_provider: SdkMeterProvider,
     instruments: InstrumentCache,
+    /// Cache of resolved entry plans, keyed by a hash of the entry's
+    /// descriptor segment ids. Built lazily on first sight of each shape.
+    plans: RwLock<HashMap<u64, Arc<EntryPlan>>>,
+    /// Descriptor cache-keys for which we have already emitted the
+    /// "unclassified field" warning. Lets the warning fire once per shape
+    /// even though `append` runs on every entry.
+    warned: RwLock<HashSet<u64>>,
+    fallback_plan: Arc<EntryPlan>,
 }
 
 impl OtelSink {
@@ -73,6 +86,75 @@ impl OtelSink {
             .with_meter_provider(meter_provider)
             .build())
     }
+
+    /// Resolve the cached plan for an entry, building one if this is the
+    /// first time we've seen this shape. Returns the fallback plan if the
+    /// entry emits no descriptors.
+    fn plan_for<E: Entry>(&self, entry: &E) -> Arc<EntryPlan> {
+        let segments: Vec<_> = entry.descriptors().collect();
+        if segments.is_empty() {
+            return Arc::clone(&self.inner.fallback_plan);
+        }
+
+        let cache_key = compute_cache_key(&segments);
+
+        if let Some(plan) = self
+            .inner
+            .plans
+            .read()
+            .expect("plan cache read poisoned")
+            .get(&cache_key)
+            .cloned()
+        {
+            return plan;
+        }
+
+        let plan = Arc::new(EntryPlan::from_descriptors(&segments));
+
+        if !plan.unclassified.is_empty() {
+            let mut warned = self.inner.warned.write().expect("warned cache poisoned");
+            if warned.insert(cache_key) {
+                let scope = &plan.scope;
+                let fields: Vec<&str> = plan.unclassified.iter().map(String::as_str).collect();
+                tracing::warn!(
+                    target: "metrique_otel",
+                    scope = %scope,
+                    fields = ?fields,
+                    "metrique-otel: fields have no instrument-kind tag; only Distribution-flagged observations will be recorded. \
+                     Apply `#[metrics(field_tag(Counter|UpDownCounter|Histogram|Gauge))]`."
+                );
+            }
+        }
+
+        self.inner
+            .plans
+            .write()
+            .expect("plan cache write poisoned")
+            .entry(cache_key)
+            .or_insert_with(|| Arc::clone(&plan));
+        plan
+    }
+
+    #[cfg(test)]
+    fn plan_cache_len(&self) -> usize {
+        self.inner
+            .plans
+            .read()
+            .expect("plan cache read poisoned")
+            .len()
+    }
+}
+
+fn compute_cache_key(segments: &[metrique_writer_core::descriptor::DescriptorRef<'_>]) -> u64 {
+    // DescriptorId is already Hash, so feeding it in directly preserves
+    // any structural distinctions baked into `DescriptorId::compute`.
+    use std::hash::Hash;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for d in segments {
+        let id: DescriptorId = d.id();
+        id.hash(&mut h);
+    }
+    h.finish()
 }
 
 #[non_exhaustive]
@@ -132,6 +214,9 @@ impl OtelSinkBuilder {
             inner: Arc::new(OtelSinkInner {
                 meter_provider,
                 instruments,
+                plans: RwLock::new(HashMap::new()),
+                warned: RwLock::new(HashSet::new()),
+                fallback_plan: Arc::new(EntryPlan::fallback()),
             }),
         }
     }
@@ -139,7 +224,8 @@ impl OtelSinkBuilder {
 
 impl<E: Entry + Send + 'static> EntrySink<E> for OtelSink {
     fn append(&self, entry: E) {
-        let mut writer = OtelEntryWriter::new(&self.inner.instruments);
+        let plan = self.plan_for(&entry);
+        let mut writer = OtelEntryWriter::new(&self.inner.instruments, &plan);
         entry.write(&mut writer);
         writer.finish();
     }
@@ -157,14 +243,24 @@ impl<E: Entry + Send + 'static> EntrySink<E> for OtelSink {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-    use std::time::SystemTime;
+    use std::time::Duration;
 
-    use metrique_writer_core::entry::EntryWriter;
+    use metrique::unit::Millisecond;
+    use metrique::unit_of_work::metrics;
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
 
     use super::*;
-    use crate::{Counter, Gauge, Histogram, UpDownCounter};
+    use crate::tags::{Counter, Gauge, Histogram, UpDownCounter};
+
+    fn in_memory_sink() -> (OtelSink, InMemoryMetricExporter, SdkMeterProvider) {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let sink = OtelSink::builder()
+            .with_meter_provider(meter_provider.clone())
+            .build();
+        (sink, exporter, meter_provider)
+    }
 
     #[test]
     fn builder_default_constructs_a_sink() {
@@ -172,40 +268,24 @@ mod tests {
         let _cloned = sink.clone();
     }
 
-    /// Hand-rolled `Entry` so the test does not depend on the `metrique`
-    /// derive macro and can target a single counter field directly.
-    struct CounterEntry {
-        name: &'static str,
-        value: Counter<u64>,
-    }
-
-    impl Entry for CounterEntry {
-        fn write<'a>(&'a self, w: &mut impl EntryWriter<'a>) {
-            w.timestamp(SystemTime::now());
-            w.value(Cow::Borrowed(self.name), &self.value);
-        }
+    #[metrics(rename_all = "PascalCase")]
+    struct CounterMetrics {
+        #[metrics(field_tag(Counter))]
+        requests: u64,
     }
 
     #[test]
     fn counter_observation_lands_in_exporter() {
-        let exporter = InMemoryMetricExporter::default();
-        let reader = PeriodicReader::builder(exporter.clone()).build();
-        let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let (sink, exporter, meter_provider) = in_memory_sink();
 
-        let sink = OtelSink::builder()
-            .with_meter_provider(meter_provider.clone())
-            .build();
-
-        sink.append(CounterEntry {
-            name: "Requests",
-            value: Counter::from(7u64),
-        });
+        sink.append(metrique::RootEntry::new(metrique::CloseValue::close(
+            CounterMetrics { requests: 7 },
+        )));
         meter_provider.force_flush().expect("force_flush");
 
         let exported = exporter
             .get_finished_metrics()
             .expect("get_finished_metrics");
-
         let names: Vec<&str> = exported
             .iter()
             .flat_map(|rm| rm.scope_metrics())
@@ -218,49 +298,37 @@ mod tests {
         );
     }
 
-    /// Single entry covering all four instrument kinds, so the dispatch
-    /// inside `InstrumentCache::record` is exercised end-to-end.
-    struct AllKindsEntry {
-        counter: Counter<u64>,
-        up_down: UpDownCounter<f64>,
-        histogram: Histogram<f64>,
-        gauge: Gauge<f64>,
-    }
-
-    impl Entry for AllKindsEntry {
-        fn write<'a>(&'a self, w: &mut impl EntryWriter<'a>) {
-            w.timestamp(SystemTime::now());
-            w.value(Cow::Borrowed("Counter"), &self.counter);
-            w.value(Cow::Borrowed("UpDown"), &self.up_down);
-            w.value(Cow::Borrowed("Hist"), &self.histogram);
-            w.value(Cow::Borrowed("Gauge"), &self.gauge);
-        }
+    #[metrics(rename_all = "PascalCase")]
+    struct AllKindsMetrics {
+        #[metrics(field_tag(Counter))]
+        counter: u64,
+        #[metrics(field_tag(UpDownCounter))]
+        up_down: f64,
+        #[metrics(field_tag(Histogram))]
+        hist: f64,
+        #[metrics(field_tag(Gauge))]
+        gauge: f64,
     }
 
     #[test]
     fn all_instrument_kinds_land_in_exporter() {
         use opentelemetry_sdk::metrics::data::AggregatedMetrics;
 
-        let exporter = InMemoryMetricExporter::default();
-        let reader = PeriodicReader::builder(exporter.clone()).build();
-        let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let (sink, exporter, meter_provider) = in_memory_sink();
 
-        let sink = OtelSink::builder()
-            .with_meter_provider(meter_provider.clone())
-            .build();
-
-        sink.append(AllKindsEntry {
-            counter: Counter::from(3u64),
-            up_down: UpDownCounter::from(-2.0_f64),
-            histogram: Histogram::from(12.5f64),
-            gauge: Gauge::from(0.42f64),
-        });
+        sink.append(metrique::RootEntry::new(metrique::CloseValue::close(
+            AllKindsMetrics {
+                counter: 3,
+                up_down: -2.0,
+                hist: 12.5,
+                gauge: 0.42,
+            },
+        )));
         meter_provider.force_flush().expect("force_flush");
 
         let exported = exporter
             .get_finished_metrics()
             .expect("get_finished_metrics");
-
         let mut by_name: Vec<(&str, &str)> = Vec::new();
         for rm in &exported {
             for sm in rm.scope_metrics() {
@@ -288,136 +356,44 @@ mod tests {
         }
     }
 
-    /// Verifies that `Unit` translates to a UCUM string and that per-value
-    /// dimensions land on the exported data point. We hand-roll a `Value`
-    /// that calls `writer.metric()` directly so the test can pin the exact
-    /// unit, observations, and dimensions without going through the
-    /// `#[metrics]` macro.
+    #[metrics(rename_all = "PascalCase")]
+    struct MixedEntry {
+        operation: String,
+        #[metrics(field_tag(Counter))]
+        requests: u64,
+        #[metrics(unit = Millisecond, field_tag(Histogram))]
+        latency: Duration,
+    }
+
+    /// String fields ride along as attributes on every metric in the same
+    /// entry, even when declared after the metric — the writer buffers
+    /// metric records until `finish()`.
     #[test]
-    fn unit_and_dimensions_round_trip() {
-        use metrique_writer_core::{
-            Observation, Unit,
-            unit::PositiveScale,
-            value::{ForceFlag, MetricFlags, Value, ValueWriter},
-        };
+    fn string_field_attaches_as_attribute_to_metrics() {
         use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 
-        use crate::CounterCtor;
+        let (sink, exporter, meter_provider) = in_memory_sink();
 
-        struct RawCounterPoint;
-        impl Value for RawCounterPoint {
-            fn write(&self, w: impl ValueWriter) {
-                w.metric(
-                    [Observation::Unsigned(42)],
-                    Unit::Byte(PositiveScale::One),
-                    [("Operation", "GET"), ("Status", "200")],
-                    MetricFlags::empty(),
-                );
-            }
-        }
-
-        struct UnitDimEntry;
-        impl Entry for UnitDimEntry {
-            fn write<'a>(&'a self, w: &mut impl EntryWriter<'a>) {
-                let v: ForceFlag<RawCounterPoint, CounterCtor> = ForceFlag::from(RawCounterPoint);
-                w.value(Cow::Borrowed("ResponseSize"), &v);
-            }
-        }
-
-        let exporter = InMemoryMetricExporter::default();
-        let reader = PeriodicReader::builder(exporter.clone()).build();
-        let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
-        let sink = OtelSink::builder()
-            .with_meter_provider(meter_provider.clone())
-            .build();
-
-        sink.append(UnitDimEntry);
+        sink.append(metrique::RootEntry::new(metrique::CloseValue::close(
+            MixedEntry {
+                operation: "GET".to_owned(),
+                requests: 1,
+                latency: Duration::from_millis(42),
+            },
+        )));
         meter_provider.force_flush().expect("force_flush");
 
         let exported = exporter
             .get_finished_metrics()
             .expect("get_finished_metrics");
-
+        let mut found_attrs: Vec<(String, String)> = Vec::new();
         let mut found_unit: Option<String> = None;
-        let mut found_value: Option<u64> = None;
-        let mut found_attrs: Vec<(String, String)> = Vec::new();
-
         for rm in &exported {
             for sm in rm.scope_metrics() {
                 for m in sm.metrics() {
-                    if m.name() != "ResponseSize" {
-                        continue;
+                    if m.name() == "Latency" {
+                        found_unit = Some(m.unit().to_owned());
                     }
-                    found_unit = Some(m.unit().to_owned());
-                    if let AggregatedMetrics::U64(MetricData::Sum(sum)) = m.data() {
-                        for dp in sum.data_points() {
-                            found_value = Some(dp.value());
-                            for kv in dp.attributes() {
-                                found_attrs
-                                    .push((kv.key.to_string(), kv.value.as_str().into_owned()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        assert_eq!(found_unit.as_deref(), Some("By"));
-        assert_eq!(found_value, Some(42));
-        found_attrs.sort();
-        assert_eq!(
-            found_attrs,
-            vec![
-                ("Operation".to_string(), "GET".to_string()),
-                ("Status".to_string(), "200".to_string()),
-            ]
-        );
-    }
-
-    /// String fields on the entry become attributes on every metric in the
-    /// same entry — including metrics declared *before* the string field,
-    /// since the writer buffers metric records until `finish()`.
-    #[test]
-    fn string_field_attaches_as_attribute_to_metrics() {
-        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-
-        struct MixedEntry {
-            requests: Counter<u64>,
-            operation: String,
-        }
-
-        impl Entry for MixedEntry {
-            fn write<'a>(&'a self, w: &mut impl EntryWriter<'a>) {
-                // Metric is emitted before the string, so this also exercises
-                // the buffer-then-flush flow.
-                w.value(Cow::Borrowed("Requests"), &self.requests);
-                w.value(Cow::Borrowed("Operation"), &self.operation);
-            }
-        }
-
-        let exporter = InMemoryMetricExporter::default();
-        let reader = PeriodicReader::builder(exporter.clone()).build();
-        let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
-
-        let sink = OtelSink::builder()
-            .with_meter_provider(meter_provider.clone())
-            .build();
-
-        sink.append(MixedEntry {
-            requests: Counter::from(1u64),
-            operation: "GET".to_owned(),
-        });
-
-        meter_provider.force_flush().expect("force_flush meter");
-
-        let exported = exporter
-            .get_finished_metrics()
-            .expect("get_finished_metrics");
-
-        let mut found_attrs: Vec<(String, String)> = Vec::new();
-        for rm in &exported {
-            for sm in rm.scope_metrics() {
-                for m in sm.metrics() {
                     if m.name() != "Requests" {
                         continue;
                     }
@@ -438,33 +414,87 @@ mod tests {
             vec![("Operation".to_string(), "GET".to_string())],
             "expected Operation=GET to ride along as a metric attribute"
         );
+        assert_eq!(
+            found_unit.as_deref(),
+            Some("ms"),
+            "expected Latency to carry ms unit derived from #[metrics(unit = Millisecond)]"
+        );
     }
 
-    /// `flush_async` drives `force_flush` on the meter provider and resolves
-    /// once it's done — exercised end-to-end (no direct
-    /// `provider.force_flush()` calls).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn flush_async_drains_meter_provider() {
-        struct E;
-        impl Entry for E {
-            fn write<'a>(&'a self, w: &mut impl EntryWriter<'a>) {
-                let count: Counter<u64> = Counter::from(3u64);
-                w.value(Cow::Borrowed("Requests"), &count);
-            }
+    /// The plan cache is keyed by `DescriptorId` — N writes of the same
+    /// shape build the plan exactly once.
+    #[test]
+    fn plan_cache_built_once_per_shape() {
+        let (sink, _exporter, _mp) = in_memory_sink();
+
+        for _ in 0..5 {
+            sink.append(metrique::RootEntry::new(metrique::CloseValue::close(
+                CounterMetrics { requests: 1 },
+            )));
+        }
+        assert_eq!(
+            sink.plan_cache_len(),
+            1,
+            "five writes of the same entry shape should populate one plan entry"
+        );
+    }
+
+    /// Meter scope name is derived from `desc.name()`. Verified by routing
+    /// two different entry types through the same sink and observing two
+    /// distinct InstrumentationScope names on the exporter.
+    #[test]
+    fn meter_scope_uses_descriptor_name() {
+        #[metrics(rename_all = "PascalCase")]
+        struct ScopeA {
+            #[metrics(field_tag(Counter))]
+            n: u64,
+        }
+        #[metrics(rename_all = "PascalCase")]
+        struct ScopeB {
+            #[metrics(field_tag(Counter))]
+            n: u64,
         }
 
-        let metric_exporter = InMemoryMetricExporter::default();
-        let reader = PeriodicReader::builder(metric_exporter.clone()).build();
-        let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let (sink, exporter, meter_provider) = in_memory_sink();
+        sink.append(metrique::RootEntry::new(metrique::CloseValue::close(
+            ScopeA { n: 1 },
+        )));
+        sink.append(metrique::RootEntry::new(metrique::CloseValue::close(
+            ScopeB { n: 1 },
+        )));
+        meter_provider.force_flush().expect("force_flush");
 
-        let sink = OtelSink::builder()
-            .with_meter_provider(meter_provider)
-            .build();
+        let exported = exporter
+            .get_finished_metrics()
+            .expect("get_finished_metrics");
+        let mut scopes: Vec<String> = exported
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .map(|sm| sm.scope().name().to_string())
+            .collect();
+        scopes.sort();
+        scopes.dedup();
+        assert!(
+            scopes.contains(&"metrique/ScopeA".to_string()),
+            "expected scope 'metrique/ScopeA' in {scopes:?}"
+        );
+        assert!(
+            scopes.contains(&"metrique/ScopeB".to_string()),
+            "expected scope 'metrique/ScopeB' in {scopes:?}"
+        );
+    }
 
-        sink.append(E);
+    /// `flush_async` drives `force_flush` on the meter provider end-to-end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_async_drains_meter_provider() {
+        let (sink, exporter, _mp) = in_memory_sink();
+
+        sink.append(metrique::RootEntry::new(metrique::CloseValue::close(
+            CounterMetrics { requests: 3 },
+        )));
         sink.flush_async().await;
 
-        let exported = metric_exporter
+        let exported = exporter
             .get_finished_metrics()
             .expect("get_finished_metrics");
         let names: Vec<&str> = exported

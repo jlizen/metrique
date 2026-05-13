@@ -16,7 +16,14 @@ use opentelemetry::{
 };
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 
-use crate::flags::InstrumentKind;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InstrumentKind {
+    Counter,
+    UpDownCounter,
+    Histogram,
+    Gauge,
+}
 
 #[derive(Clone)]
 pub(crate) struct InstrumentCache {
@@ -26,6 +33,7 @@ pub(crate) struct InstrumentCache {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct InstrumentKey {
+    pub(crate) scope: &'static str,
     pub(crate) name: String,
     pub(crate) kind: InstrumentKind,
 }
@@ -47,6 +55,7 @@ impl InstrumentCache {
 
     pub(crate) fn record(
         &self,
+        scope: &'static str,
         name: &str,
         kind: InstrumentKind,
         observations: impl IntoIterator<Item = Observation>,
@@ -54,12 +63,13 @@ impl InstrumentCache {
         attributes: &[KeyValue],
     ) {
         let key = InstrumentKey {
+            scope,
             name: name.to_owned(),
             kind,
         };
         let mut map = self.instruments.lock().expect("instrument cache poisoned");
         let instrument = map.entry(key).or_insert_with(|| {
-            let meter = self.meter_provider.meter("metrique-otel");
+            let meter = self.meter_provider.meter(scope);
             // Instrument unit is fixed at creation time. If the same metric
             // name is later recorded with a different unit, the original wins
             // — that mirrors the OTEL SDK's own behavior.

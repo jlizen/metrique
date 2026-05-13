@@ -16,7 +16,8 @@ use metrique::unit_of_work::metrics;
 use metrique_aggregation::{
     aggregate, aggregator::KeyedAggregator, histogram::Histogram, sink::WorkerSink, value::Sum,
 };
-use metrique_otel::{Counter, OtelSink};
+use metrique_otel::OtelSink;
+use metrique_otel::tags::Counter;
 use opentelemetry_sdk::metrics::{
     InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
     data::{AggregatedMetrics, MetricData},
@@ -29,7 +30,8 @@ struct RequestMetrics {
     operation: String,
 
     #[aggregate(strategy = Sum)]
-    request_count: Counter<u64>,
+    #[metrics(field_tag(Counter))]
+    request_count: u64,
 
     #[aggregate(strategy = Histogram<Duration>)]
     latency: Duration,
@@ -52,7 +54,7 @@ async fn aggregated_pipeline_emits_counters_and_histograms() {
     for (op, lat_ms) in [("GET", 12u64), ("GET", 18), ("GET", 9), ("POST", 47)] {
         RequestMetrics {
             operation: op.to_owned(),
-            request_count: Counter::from(1),
+            request_count: 1,
             latency: Duration::from_millis(lat_ms),
         }
         .close_and_merge(worker.clone());
@@ -84,7 +86,7 @@ async fn aggregated_pipeline_emits_counters_and_histograms() {
                             attrs.sort();
                             let op = attrs
                                 .iter()
-                                .find(|(k, _)| k == "operation")
+                                .find(|(k, _)| k == "Operation")
                                 .map(|(_, v)| v.clone())
                                 .unwrap_or_default();
                             counter_values_by_op.push((op, dp.value()));
@@ -117,14 +119,14 @@ async fn aggregated_pipeline_emits_counters_and_histograms() {
     assert!(
         counter_attrs
             .iter()
-            .all(|attrs| attrs.iter().any(|(k, _)| k == "operation")),
+            .all(|attrs| attrs.iter().any(|(k, _)| k == "Operation")),
         "every counter point should carry the Operation attribute, got {counter_attrs:?}"
     );
 
     assert!(
         histogram_attrs.iter().any(|attrs| attrs
             .iter()
-            .any(|(k, v)| k == "operation" && (v == "GET" || v == "POST"))),
+            .any(|(k, v)| k == "Operation" && (v == "GET" || v == "POST"))),
         "expected Operation attribute on histogram points, got {histogram_attrs:?}"
     );
     assert_eq!(
