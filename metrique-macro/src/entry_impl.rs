@@ -16,6 +16,179 @@ mod struct_impl;
 pub(crate) use enum_impl::generate_enum_entry_impl;
 pub(crate) use struct_impl::generate_struct_entry_impl;
 
+use crate::FieldTagAttr;
+
+/// Output of descriptor generation for a struct or enum entry.
+pub(crate) struct DescriptorOutput {
+    /// The `__metrique_descriptor(style)` inherent impl with 4 statics.
+    /// Goes outside the `InflectableEntry` impl block but inside `const _: ()`.
+    pub(crate) trait_impls: Ts2,
+    /// The `fn descriptors()` method body.
+    /// Goes inside the `InflectableEntry` impl block.
+    pub(crate) method: Ts2,
+}
+
+/// Metadata for a single field in the descriptor, collected at macro time.
+pub(crate) struct DescriptorFieldMeta {
+    /// Field name in each style: [preserve, pascal, snake, kebab]
+    pub(crate) names: [String; 4],
+    /// Resolved tag token streams for this field
+    pub(crate) tags: Vec<Ts2>,
+    /// Unit expression (None or Some(<Unit>::UNIT))
+    pub(crate) unit_expr: Ts2,
+}
+
+/// Generates the `__metrique_descriptor(style: u8)` inherent impl from collected field metadata.
+///
+/// Produces a match with 4 arms, each containing a static `EntryDescriptor` with field names
+/// resolved for that style. The style constants from `metrique-core` are used as match patterns.
+pub(crate) fn generate_descriptor_impl(
+    entry_name: &Ident,
+    generics: &syn::Generics,
+    struct_name: &str,
+    fields: &[DescriptorFieldMeta],
+    timestamp_descriptor: &Ts2,
+) -> Ts2 {
+    let num_fields = fields.len();
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    // Tag statics are shared across all 4 style arms because tags don't vary by name style.
+    // Each field gets one static array of FieldTag.
+    let tag_statics: Vec<Ts2> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let ident = format_ident!("__METRIQUE_TAGS_{}", i);
+            let tags = &f.tags;
+            let num_tags = tags.len();
+            quote! {
+                static #ident: [::metrique::writer::core::FieldTag; #num_tags] = [
+                    #(#tags),*
+                ];
+            }
+        })
+        .collect();
+
+    // Generate one match arm per name style. Each arm contains a static EntryDescriptor
+    // with field names resolved for that style. The match selects the right static based
+    // on the style index passed by the caller (hardcoded at macro time from rename_all).
+    let style_names = crate::inflect::NameStyle::DESCRIPTOR_STYLE_NAMES;
+    let style_arms: Vec<Ts2> = (0..style_names.len())
+        .map(|style_idx| {
+            // Map the array index to the corresponding runtime STYLE_* constant.
+            let style_const = style_const_for(
+                crate::inflect::NameStyle::DESCRIPTOR_STYLES[style_idx],
+            );
+            let desc_ident = format_ident!("__METRIQUE_DESC_{}", style_names[style_idx]);
+            let fields_ident = format_ident!("__METRIQUE_FIELDS_{}", style_names[style_idx]);
+
+            // Each field's name is pre-resolved for this style at macro time.
+            let field_exprs: Vec<Ts2> = fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let name = &f.names[style_idx];
+                    let tags_ident = format_ident!("__METRIQUE_TAGS_{}", i);
+                    let unit_expr = &f.unit_expr;
+                    quote! {
+                        ::metrique::writer::core::FieldDescriptor::__metrique_private_new(
+                            #name,
+                            &#tags_ident,
+                            ::metrique::writer::core::FieldShape::Opaque,
+                            #unit_expr,
+                        )
+                    }
+                })
+                .collect();
+
+            quote! {
+                #style_const => {
+                    static #fields_ident: [::metrique::writer::core::FieldDescriptor; #num_fields] = [
+                        #(#field_exprs),*
+                    ];
+                    static #desc_ident: ::metrique::writer::core::EntryDescriptor =
+                        ::metrique::writer::core::EntryDescriptor::__metrique_private_new(
+                            #struct_name,
+                            &#fields_ident,
+                            #timestamp_descriptor,
+                        );
+                    &#desc_ident
+                }
+            }
+        })
+        .collect();
+
+    quote! {
+        impl #impl_generics #entry_name #ty_generics #where_clause {
+            #[doc(hidden)]
+            #[inline(always)]
+            fn __metrique_descriptor(__style: u8) -> &'static ::metrique::writer::core::EntryDescriptor {
+                #(#tag_statics)*
+                match __style {
+                    #(#style_arms)*
+                    _ => unreachable!("unknown descriptor style index")
+                }
+            }
+        }
+    }
+}
+
+/// Returns the style constant token stream for a given `NameStyle`.
+/// Maps the macro-internal `NameStyle` enum to the runtime `::metrique::STYLE_*` constants.
+pub(crate) fn style_const_for(style: crate::inflect::NameStyle) -> Ts2 {
+    match style {
+        crate::inflect::NameStyle::Preserve => quote! { ::metrique::STYLE_PRESERVE },
+        crate::inflect::NameStyle::PascalCase => quote! { ::metrique::STYLE_PASCAL },
+        crate::inflect::NameStyle::SnakeCase => quote! { ::metrique::STYLE_SNAKE },
+        crate::inflect::NameStyle::KebabCase => quote! { ::metrique::STYLE_KEBAB },
+    }
+}
+
+pub(crate) fn resolve_field_tags(
+    field_tags: &[FieldTagAttr],
+    default_tags: &[FieldTagAttr],
+) -> Vec<Ts2> {
+    let mut resolved = Vec::new();
+
+    // Field-level tags take priority
+    for tag in field_tags {
+        let path = &tag.path;
+        let state = if tag.skip {
+            quote! { ::metrique::writer::core::FieldTagState::Absent }
+        } else {
+            quote! { ::metrique::writer::core::FieldTagState::Present }
+        };
+        resolved.push(quote! {
+            ::metrique::writer::core::FieldTag::__metrique_private_new(
+                ::std::any::TypeId::of::<#path>(),
+                #state,
+            )
+        });
+    }
+
+    // Default tags fill in for paths not already specified at field level
+    for default_tag in default_tags {
+        let path = &default_tag.path;
+        let already_specified = field_tags.iter().any(|ft| ft.path == *path);
+        if already_specified {
+            continue;
+        }
+        let state = if default_tag.skip {
+            quote! { ::metrique::writer::core::FieldTagState::Absent }
+        } else {
+            quote! { ::metrique::writer::core::FieldTagState::Present }
+        };
+        resolved.push(quote! {
+            ::metrique::writer::core::FieldTag::__metrique_private_new(
+                ::std::any::TypeId::of::<#path>(),
+                #state,
+            )
+        });
+    }
+
+    resolved
+}
+
 /// Hygiene helper for generated method-local identifiers.
 ///
 /// When `#[metrics]` is expanded inside `macro_rules!`, field names from macro parameters
@@ -247,13 +420,48 @@ fn generate_field_writes(
     writes
 }
 
-/// Return an iterator that chains the iterators in `iterators`.
+/// Return an iterator that chains flattened children for a descriptor, handling
+/// conditional inclusion of cfg-gated fields.
 ///
-/// This calls `chain` in a binary tree fashion to avoid problems with the recursion limit,
-/// e.g. `I1.chain(I2).chain(I3.chain(I4))`
-/// Chains iterators into a balanced binary tree of `.chain()` calls.
-/// Returns `::std::iter::empty()` for empty input.
-fn make_binary_tree_chain(iterators: Vec<Ts2>) -> Ts2 {
+/// `children` is a list of `(is_cfg_gated, iterator_expression)` pairs in declaration order.
+/// Non-cfg children are full iterator expressions (e.g., `child.descriptors()`).
+/// Cfg-gated children are let-rebinding statements (e.g., `#[cfg(test)] let __desc = ...`).
+///
+/// When no cfg children exist, uses binary tree chaining for balanced type nesting that
+/// avoid recursion limit issues.
+/// When cfg children exist, uses linear let-rebinding to preserve interleaved order.
+pub(crate) fn combine_descriptor_chains(base_expr: Ts2, children: &[(bool, Ts2)]) -> Ts2 {
+    let has_cfg = children.iter().any(|(cfg, _)| *cfg);
+
+    if has_cfg {
+        // TODO: linear chaining may hit type recursion limits for structs with many
+        // cfg-gated flatten fields. These are uncommon; if it arises, consider a
+        // custom iterator type (like the enum path uses).
+        let rebindings: Vec<_> = children
+            .iter()
+            .map(|(is_cfg, t)| {
+                if *is_cfg {
+                    t.clone()
+                } else {
+                    quote! { let __desc = __desc.chain(#t); }
+                }
+            })
+            .collect();
+        quote! {
+            let __desc = #base_expr;
+            #(#rebindings)*
+            __desc
+        }
+    } else if children.is_empty() {
+        base_expr
+    } else {
+        let mut all_iters = vec![base_expr];
+        all_iters.extend(children.iter().map(|(_, t)| t.clone()));
+        make_binary_tree_chain(all_iters)
+    }
+}
+
+pub(crate) fn make_binary_tree_chain(iterators: Vec<Ts2>) -> Ts2 {
     if iterators.is_empty() {
         return quote! { ::std::iter::empty() };
     }
